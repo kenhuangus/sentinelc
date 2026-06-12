@@ -1,0 +1,8 @@
+# IOC: literal strings to flag inside scanned files (a tiny YARA-subset).
+# Case-insensitive substring match -> FILE.IOC_STRING (HIGH) on --scan-path.
+# Copy this file to yara_subset.txt and add your own indicators / C2 domains.
+# powershell -enc
+# DownloadString
+# FromBase64String
+# Invoke-Expression
+# WScript.Shell

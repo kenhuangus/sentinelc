@@ -1,0 +1,21 @@
+# Build artifacts and all local scan data
+/build/
+*.exe
+*.o
+*.obj
+*.dll
+*.lib
+
+# Local baselines / system inventories — NEVER commit (contain host file paths)
+*.tsv
+baseline*
+
+# Live IOC lists are incident/host-specific; ship the .example templates instead
+/rules/ioc_ips.txt
+/rules/ioc_hashes.txt
+/rules/yara_subset.txt
+
+# Editor / OS noise
+*.swp
+.DS_Store
+Thumbs.db

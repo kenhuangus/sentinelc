@@ -1,0 +1,19 @@
+# SentinelC allowlist - one entry per line. Lines starting with # are comments.
+# An entry matches a finding's binary if it equals the file's base name
+# (case-insensitive) OR is a substring of the full path. Allowlisted images
+# are skipped by the process/service/keylog scanners.
+#
+# Keep this conservative: every line here is something the scanner will NOT
+# report. Prefer full path fragments over bare names to avoid masquerade gaps
+# (an attacker naming malware "slack.exe" would otherwise be allowlisted).
+
+# --- Microsoft Defender (signed, lives in a versioned ProgramData path) ---
+\ProgramData\Microsoft\Windows Defender\Platform\
+
+# --- common signed developer tools that legitimately run from user paths ---
+# Uncomment / adjust for your environment after reviewing the first scan.
+# \AppData\Local\Programs\Microsoft VS Code\
+# \AppData\Local\Programs\LM Studio\
+# \AppData\Local\Microsoft\Teams\
+# \AppData\Local\slack\
+# \AppData\Local\Programs\Git\

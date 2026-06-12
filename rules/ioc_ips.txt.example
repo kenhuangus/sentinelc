@@ -1,0 +1,5 @@
+# IOC: known-bad IPv4 addresses, one per line. # comments allowed.
+# A network connection to any IP here -> NET.IOC_MATCH (HIGH).
+# Copy this file to ioc_ips.txt and populate from your threat-intel feed.
+# 203.0.113.10
+# 198.51.100.42

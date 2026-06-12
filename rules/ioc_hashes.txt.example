@@ -1,0 +1,4 @@
+# IOC: known-bad SHA-256 hashes (64 hex chars), one per line. # comments allowed.
+# Used by --scan-path / --deep file scans -> FILE.IOC_HASH (HIGH).
+# Copy this file to ioc_hashes.txt and populate.
+# 275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f
