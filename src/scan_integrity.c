@@ -359,6 +359,13 @@ typedef struct {
     FimList  *list;
     bool      noted_denied;   /* note access-denied at most once */
 
+    /* --integrity fast path: when set, a file whose size AND mtime exactly
+     * match its baseline entry is NOT re-hashed -- we reuse the baseline's
+     * stored sha. NULL during a --baseline build (always full-hash), and NULL
+     * when cfg->deep forces a paranoid full re-verify. See walk_dir(). */
+    FimList  *baseline;       /* sorted-by-key baseline list, or NULL */
+    uint64_t  files_skipped;  /* files whose hash was reused from baseline */
+
     /* progress / two-pass state */
     bool         count_only;  /* pass 1: tally only, no hash/list/qualify */
     uint64_t     files_total; /* pass 1 result: relevant file count */
@@ -367,6 +374,9 @@ typedef struct {
     uint64_t     bytes_done;  /* pass 2: bytes hashed so far */
     ProgressBar *bar;         /* pass 2 progress bar (may be NULL) */
 } WalkState;
+
+/* find an entry by lowercased key via binary search (defined below) */
+static FimEntry *list_find(FimList *l, const char *key);
 
 /* Recurse a directory (wide path), collecting relevant files into st->list. */
 static void walk_dir(WalkState *st, const wchar_t *wdir, int depth)
@@ -458,6 +468,45 @@ static void walk_dir(WalkState *st, const wchar_t *wdir, int depth)
         st->files_done++;
         st->bytes_done += (size <= FIM_BIG_FILE_BYTES) ? size : 0;
         progress_step(st->bar, st->bytes_done, u8abs);
+
+        /* ---- --integrity fast path: skip re-hashing unchanged files ----
+         * If a baseline is threaded in (st->baseline != NULL, i.e. this is a
+         * --integrity CHECK and cfg->deep is NOT set), look the file up by its
+         * lowercased absolute path. If the baseline entry's size AND mtime
+         * exactly match what FindFirstFile/FindNextFile reports, the content is
+         * (assumed) unchanged: copy the baseline's stored sha into the new
+         * manifest entry WITHOUT calling sha256_file_raw. This turns a ~10-min
+         * full re-hash into seconds when little changed; the reused sha makes
+         * the skipped file's leaf -- and thus the Merkle root -- match the
+         * baseline, which is the desired fast MATCH.
+         *
+         * SECURITY TRADEOFF: skipping on size+mtime alone misses a content
+         * change that preserves both (timestomping). That is why the --baseline
+         * BUILD never takes this path (st->baseline is NULL there, so the
+         * trusted baseline is always built from real hashes), and why
+         * `--integrity --deep` forces a full re-hash: run_check leaves
+         * st->baseline NULL when cfg->deep is set, making --deep the paranoid
+         * full-verify path. */
+        if (st->baseline) {
+            char keylc[SC_MAX_PATH * 2];
+            snprintf(keylc, sizeof keylc, "%s", u8abs);
+            str_lower(keylc);
+            FimEntry *b = list_find(st->baseline, keylc);
+            if (b && b->size == size && b->mtime == mtime) {
+                /* reuse the baseline sha (bounded copy of the 64-hex digest) */
+                char hex[65];
+                snprintf(hex, sizeof hex, "%s", b->sha);
+                if (!list_add(st->list, u8abs, hex, size, mtime)) {
+                    free(full);
+                    FindClose(h);
+                    return;
+                }
+                st->files_skipped++;
+                free(full);
+                continue;   /* no sha256_file_raw for this file */
+            }
+            /* fall through: new file, or size/mtime differ -> hash it below */
+        }
 
         /* content hash (stream), unless the file is huge */
         char hex[65];
@@ -811,15 +860,22 @@ static void walk_all_roots(WalkState *st, const RootSet *roots, char *skipped)
     }
 }
 
+/* Build the current manifest by walking the roots (two passes: count, then
+ * hash). When baseline != NULL (only on a non-deep --integrity check) the walk
+ * skips re-hashing files whose size+mtime match the baseline, reusing the
+ * stored sha. baseline MUST be sorted by key (list_find binary-searches it).
+ * Pass baseline == NULL for the --baseline build and for --integrity --deep so
+ * every file is fully hashed. */
 static void build_manifest(ScanCtx *c, const RootSet *roots, FimList *out,
-                           char skipped[1024])
+                           char skipped[1024], FimList *baseline)
 {
     skipped[0] = '\0';
 
     WalkState st;
     memset(&st, 0, sizeof st);
-    st.ctx  = c;
-    st.list = out;
+    st.ctx      = c;
+    st.list     = out;
+    st.baseline = baseline;
 
     /* PASS 1: count relevant files and the bytes that will actually be hashed,
      * so the bar in pass 2 can show an accurate %/ETA. Cheap: enumeration +
@@ -876,7 +932,9 @@ static void run_baseline(ScanCtx *c, RootSet *roots)
     DWORD t0 = GetTickCount();
     FimList list; list_init(&list);
     char skipped[1024];
-    build_manifest(c, roots, &list, skipped);
+    /* baseline BUILD: never skip -- always full-hash every file so the trusted
+     * baseline is built from real content hashes. */
+    build_manifest(c, roots, &list, skipped, NULL);
 
     char root_hex[65];
     merkle_root(&list, root_hex);
@@ -935,9 +993,20 @@ static void run_check(ScanCtx *c, RootSet *roots, bool roots_from_cli)
         roots_parse_list(roots, hdr.roots);
     }
 
+    /* The baseline file is written sorted by path, so `base` is already sorted
+     * by key; sort explicitly anyway so both the walk's skip lookup and the
+     * diff below can rely on list_find()'s binary search. */
+    qsort(base.items, base.count, sizeof(FimEntry), entry_cmp);
+
+    /* Fast --integrity path: thread the loaded baseline into the walk so files
+     * whose size+mtime are unchanged reuse their stored sha instead of being
+     * re-hashed. cfg->deep disables this (paranoid full re-verify that catches
+     * timestomped content changes), so pass NULL when --deep is set. */
+    FimList *skip_base = (c->cfg && c->cfg->deep) ? NULL : &base;
+
     char skipped[1024];
     FimList cur; list_init(&cur);
-    build_manifest(c, roots, &cur, skipped);
+    build_manifest(c, roots, &cur, skipped, skip_base);
 
     char cur_root[65];
     merkle_root(&cur, cur_root);

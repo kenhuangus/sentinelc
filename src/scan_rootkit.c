@@ -747,6 +747,11 @@ static void driver_inventory(ScanCtx *c)
 
         bool bad_sign = (v == SIGN_UNSIGNED || v == SIGN_INVALID ||
                          v == SIGN_SIGNED); /* SIGNED but not MS = non-MS */
+        /* Audit H4: "could not verify" (SIGN_UNKNOWN) is NOT clean. A driver we
+         * could not verify that ALSO sits outside System32\drivers or in a
+         * user-writable path is suspicious-pending, not silently skipped. A
+         * validly MS-signed driver (SIGN_SIGNED_MS) remains the only true pass. */
+        bool unverifiable = (v == SIGN_UNKNOWN);
 
         /* Flag drivers that are unsigned/non-MS AND located outside the
          * legitimate driver dir, or in a user-writable path. */
@@ -766,6 +771,27 @@ static void driver_inventory(ScanCtx *c)
                        : (v == SIGN_INVALID) ? "INVALID-signature"
                        : "non-Microsoft-signed",
                      why, signer[0] ? signer : "(none)");
+            if (++emitted >= RK_MAX_HIDDEN_FILE)
+                break;
+        }
+        /* RK.SUSPICIOUS_DRIVER (weak) -- signature could not be verified, in a
+         * security-relevant-but-unusual location. Lower confidence than the
+         * confirmed-bad branch above (55); we do NOT flag an unverifiable driver
+         * that sits in the legitimate System32\drivers dir and is not
+         * user-writable, to avoid noise on transiently-locked inbox drivers. */
+        else if (unverifiable && (!in_driver_dir || user_writable)) {
+            const char *why =
+                user_writable ? "in a user-writable path"
+                              : "outside System32\\drivers";
+            bus_emit(c->bus, "RK.SUSPICIOUS_DRIVER", SEV_LOW, 35, ACT_REVIEW, 0,
+                     path, "loaded kernel driver: signature unverifiable",
+                     "loaded driver '%s' signature could not be verified "
+                     "(file locked / catalog context unavailable / verify error) "
+                     "and it is %s. Treated as suspicious-pending, not clean. "
+                     "NOTE: user mode cannot inspect SSDT/IRP/inline kernel "
+                     "hooks -- a signed-but-malicious or DKOM driver may not "
+                     "show here.",
+                     path, why);
             if (++emitted >= RK_MAX_HIDDEN_FILE)
                 break;
         }

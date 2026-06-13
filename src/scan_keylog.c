@@ -241,7 +241,18 @@ static bool enum_proc_modules(DWORD pid, DllTrack *tracks, size_t *ntracks)
     if (count > DLL_MOD_CAP)
         count = DLL_MOD_CAP;
 
-    /* per-process dedup: collect this proc's non-system DLL paths, unique */
+    /* Resolve each module path at most ONCE per handle (N syscalls, not N^2),
+     * caching the kept .dll paths into a bounded local array, then dedup by
+     * string-comparing against the already-cached paths. The array is sized to
+     * the module cap (DLL_MOD_CAP), so it can never overflow. Heap-allocated to
+     * keep the stack frame small and avoid shared mutable state. */
+    char (*seen)[SC_MAX_PATH] = malloc((size_t)DLL_MOD_CAP * SC_MAX_PATH);
+    if (!seen) {
+        CloseHandle(h);
+        return false;
+    }
+    size_t nseen = 0;
+
     for (DWORD i = 0; i < count; i++) {
         char path[SC_MAX_PATH];
         if (GetModuleFileNameExA(h, mods[i], path, sizeof(path)) == 0)
@@ -254,21 +265,25 @@ static bool enum_proc_modules(DWORD pid, DllTrack *tracks, size_t *ntracks)
         if (!str_iendswith(path, ".dll"))
             continue;
 
-        /* check for duplicate within this process */
+        /* check for duplicate within this process against cached paths */
         bool dup = false;
-        for (DWORD j = 0; j < i && !dup; j++) {
-            char prev[SC_MAX_PATH];
-            if (GetModuleFileNameExA(h, mods[j], prev, sizeof(prev)) == 0)
-                continue;
-            if (_stricmp(prev, path) == 0)
+        for (size_t j = 0; j < nseen && !dup; j++) {
+            if (_stricmp(seen[j], path) == 0)
                 dup = true;
         }
         if (dup)
             continue;
 
+        /* cache this unique path (bounded by DLL_MOD_CAP, can't overflow) */
+        if (nseen < DLL_MOD_CAP) {
+            copy_target(seen[nseen], SC_MAX_PATH, path);
+            nseen++;
+        }
+
         dll_record(tracks, ntracks, path);
     }
 
+    free(seen);
     CloseHandle(h);
     return true;
 }

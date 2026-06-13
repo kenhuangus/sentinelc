@@ -36,8 +36,12 @@ $libs = @('-lwintrust','-lcrypt32','-lbcrypt','-liphlpapi','-lws2_32','-lpsapi',
           '-ladvapi32','-lkernel32','-lm')
 $out = "$root\build\sentinelc.exe"
 
-$args = @('-std=c11','-Wall','-Wextra','-O2','-I',"$root\include") + $srcs +
-        @('-o',$out) + $libs
+# Exploit-mitigation flags: stack canaries + FORTIFY + format checks (compile),
+# ASLR / DEP / high-entropy ASLR (link). For CFG/CET, build release with MSVC.
+$hardenC = @('-fstack-protector-strong','-D_FORTIFY_SOURCE=2','-Wformat','-Wformat-security','-fno-strict-aliasing')
+$hardenL = @('-Wl,--dynamicbase,--nxcompat,--high-entropy-va')
+$args = @('-std=c11','-Wall','-Wextra','-O2') + $hardenC + @('-I',"$root\include") + $srcs +
+        @('-o',$out) + $hardenL + $libs
 Write-Host "Compiling $($srcs.Count) modules..."
 & $gcc @args
 if ($LASTEXITCODE -ne 0) { Write-Error "Build failed."; exit 1 }

@@ -118,6 +118,7 @@ typedef struct {
     int    sign_state;                /* SignVerdict (see sign.h values) cached */
     bool   suspicious_mem;            /* private RWX / unbacked exec found */
     bool   accessible;                /* could we open it for full inspection */
+    uint64_t create_time;            /* process CreateTime (FILETIME u64), 0 unknown */
 } ProcRec;
 
 typedef struct {
@@ -157,6 +158,7 @@ void scan_persist(ScanCtx *c);   /* scan_persist.c */
 void scan_keylog(ScanCtx *c);    /* scan_keylog.c */
 void scan_path(ScanCtx *c);      /* pe.c/heur -- targeted file/dir scan */
 void scan_integrity(ScanCtx *c); /* scan_integrity.c -- Merkle FIM baseline/check */
+void scan_creds(ScanCtx *c);     /* scan_creds.c -- credential-access detection */
 
 /* correlation pass: promotes multi-signal artifacts. engine.c */
 void correlate(ScanCtx *c);

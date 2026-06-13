@@ -453,8 +453,315 @@ static void scan_appinit(ScanCtx *c)
 }
 
 /* ------------------------------------------------------------------ *
+ *  AppCertDlls  (loaded into every process that calls a Win32 process-
+ *  creation API via the Application Certification callback)  T1546.009
+ * ------------------------------------------------------------------ */
+
+static void scan_appcert(ScanCtx *c)
+{
+    static const char *APPCERT =
+        "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\AppCertDlls";
+
+    HKEY hk;
+    LONG rc = RegOpenKeyExA(HKEY_LOCAL_MACHINE, APPCERT, 0,
+                            KEY_READ | KEY_QUERY_VALUE, &hk);
+    if (rc != ERROR_SUCCESS) {
+        if (rc == ERROR_ACCESS_DENIED)
+            ctx_note_limit(c, "persist: access denied reading AppCertDlls");
+        return;   /* key absent on a clean system -> normal */
+    }
+
+    DWORD idx = 0;
+    for (;;) {
+        char  name[SC_NAME_LEN];
+        DWORD nlen = sizeof name;
+        BYTE  data[SC_MAX_CMDLINE];
+        DWORD dlen = sizeof data;
+        DWORD type = 0;
+
+        LONG e = RegEnumValueA(hk, idx, name, &nlen, NULL, &type, data, &dlen);
+        if (e == ERROR_NO_MORE_ITEMS) break;
+        idx++;
+        if (e != ERROR_SUCCESS) continue;
+        if (type != REG_SZ && type != REG_EXPAND_SZ) continue;
+        if (dlen == 0) continue;
+        data[(dlen < sizeof data) ? dlen : sizeof data - 1] = '\0';
+        data[sizeof data - 1] = '\0';
+
+        char raw[SC_MAX_CMDLINE];
+        if (type == REG_EXPAND_SZ)
+            expand_env((const char *)data, raw, sizeof raw);
+        else { strncpy(raw, (const char *)data, sizeof raw - 1);
+               raw[sizeof raw - 1] = '\0'; }
+        trim_ws(raw);
+        if (raw[0] == '\0') continue;
+
+        char target[SC_MAX_PATH];
+        extract_target(raw, target, sizeof target);
+        if (target[0] == '\0') {
+            strncpy(target, raw, sizeof target - 1);
+            target[sizeof target - 1] = '\0';
+        }
+        if (allowlist_match(target) || allowlist_match(name)) continue;
+
+        char reason[128];
+        bool risky = target_is_risky(target, reason, sizeof reason, NULL);
+        int conf = risky ? 90 : 80;
+
+        bus_emit(c->bus, "PERSIST.APPCERT", SEV_HIGH, conf,
+                 ACT_REVIEW, 0, target,
+                 "AppCertDlls injection DLL configured",
+                 "HKLM\\%s value \"%s\" = \"%s\" -> %s%s%s%s",
+                 APPCERT, name, raw, target,
+                 reason[0] ? " [" : "", reason[0] ? reason : "",
+                 reason[0] ? "]" : "");
+    }
+    RegCloseKey(hk);
+}
+
+/* ------------------------------------------------------------------ *
+ *  LSA security/authentication/notification providers (SSP/AP DLLs
+ *  loaded by LSASS)  T1547.005 -- credential-theft persistence.
+ * ------------------------------------------------------------------ */
+
+/* Known-good inbox LSA provider base names (lower-case, no extension). When
+ * one of these is signed and lives under System32 we suppress it as noise. */
+static bool is_inbox_lsa_provider(const char *base_lower)
+{
+    static const char *good[] = {
+        "kerberos", "msv1_0", "schannel", "wdigest", "tspkg", "pku2u",
+        "cloudap", "negoexts", "ctxauth", "livessp", NULL
+    };
+    for (int i = 0; good[i]; i++)
+        if (strcmp(base_lower, good[i]) == 0) return true;
+    return false;
+}
+
+static void lsa_check_provider(ScanCtx *c, const char *valuename,
+                               const char *entry)
+{
+    /* entry is a base name (no path/extension), e.g. "msv1_0". Resolve to
+     * %WINDIR%\System32\<name>.dll for sign/path checking. */
+    char base[SC_NAME_LEN];
+    strncpy(base, entry, sizeof base - 1);
+    base[sizeof base - 1] = '\0';
+    trim_ws(base);
+    /* strip surrounding double-quotes some entries carry, then re-trim */
+    if (base[0] == '"') memmove(base, base + 1, strlen(base));
+    { size_t bq = strlen(base); if (bq && base[bq - 1] == '"') base[bq - 1] = '\0'; }
+    trim_ws(base);
+    if (base[0] == '\0') return;
+    /* require a plausible module name: at least one alphanumeric char, else
+     * it is a stray separator/quote in the REG_MULTI_SZ, not a provider. */
+    {
+        bool alnum = false;
+        for (const char *q = base; *q; q++)
+            if ((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') ||
+                (*q >= '0' && *q <= '9')) { alnum = true; break; }
+        if (!alnum) return;
+    }
+
+    /* Some entries carry a path or extension; reduce to the leaf for the
+     * inbox comparison, but build the resolved path from the bare name. */
+    char baselow[SC_NAME_LEN];
+    strncpy(baselow, base, sizeof baselow - 1);
+    baselow[sizeof baselow - 1] = '\0';
+    str_lower(baselow);
+    /* strip a trailing .dll if present for the known-good comparison */
+    size_t bl = strlen(baselow);
+    if (bl > 4 && strcmp(baselow + bl - 4, ".dll") == 0)
+        baselow[bl - 4] = '\0';
+
+    char windir[MAX_PATH];
+    UINT wn = GetWindowsDirectoryA(windir, sizeof windir);
+    if (wn == 0 || wn >= sizeof windir) return;
+
+    char target[SC_MAX_PATH];
+    /* If entry already looks like a path, use it as-is; else resolve. */
+    if (strchr(base, '\\') || strchr(base, '/')) {
+        expand_env(base, target, sizeof target);
+    } else {
+        snprintf(target, sizeof target, "%s\\System32\\%s.dll",
+                 windir, base);
+    }
+
+    if (allowlist_match(target) || allowlist_match(base)) return;
+
+    SignVerdict v = SIGN_UNKNOWN;
+    char reason[128];
+    bool risky = target_is_risky(target, reason, sizeof reason, &v);
+
+    bool signed_ms = (v == SIGN_SIGNED_MS);
+    bool in_system32 = (path_classify(target) == PATHLOC_SYSTEM);
+
+    /* A validly MS-signed provider under System32 is the clean state. Windows
+     * ships many beyond any fixed name list (scecli, rassfm, ...), so suppress
+     * on signature+location, not on a hardcoded set -- that set only refines
+     * the note. This is what keeps a clean LSASS quiet. */
+    if (signed_ms && in_system32) {
+        const char *note = is_inbox_lsa_provider(baselow) ? "inbox/signed"
+                                                          : "signed/system32";
+        bus_emit(c->bus, "PERSIST.LSA_PROVIDER", SEV_LOW, 30,
+                 ACT_REVIEW, 0, target,
+                 "LSA provider (signed, System32)",
+                 "HKLM\\...\\Lsa %s entry \"%s\" -> %s [%s]",
+                 valuename, base, target, note);
+        return;
+    }
+
+    /* Unexpected / unsigned / user-writable LSA provider: credential-theft
+     * persistence. CRIT when unsigned or user-writable. */
+    bool unsigned_or_writable = risky || v == SIGN_UNSIGNED ||
+                                v == SIGN_INVALID;
+    Severity sev = unsigned_or_writable ? SEV_CRIT : SEV_HIGH;
+
+    bus_emit(c->bus, "PERSIST.LSA_PROVIDER", sev, 80,
+             ACT_REVIEW, 0, target,
+             "Unexpected LSA security provider (LSASS DLL)",
+             "HKLM\\...\\Lsa %s entry \"%s\" -> %s%s%s%s",
+             valuename, base, target,
+             reason[0] ? " [" : "", reason[0] ? reason : "",
+             reason[0] ? "]" : "");
+}
+
+static void scan_lsa_providers(ScanCtx *c)
+{
+    static const char *LSA = "SYSTEM\\CurrentControlSet\\Control\\Lsa";
+    static const char *values[] = {
+        "Security Packages", "Authentication Packages",
+        "Notification Packages", NULL
+    };
+
+    HKEY hk;
+    LONG rc = RegOpenKeyExA(HKEY_LOCAL_MACHINE, LSA, 0,
+                            KEY_READ | KEY_QUERY_VALUE, &hk);
+    if (rc != ERROR_SUCCESS) {
+        if (rc == ERROR_ACCESS_DENIED)
+            ctx_note_limit(c, "persist: access denied reading Lsa");
+        return;
+    }
+
+    for (int vi = 0; values[vi]; vi++) {
+        BYTE  data[SC_MAX_CMDLINE];
+        DWORD dlen = sizeof data;
+        DWORD type = 0;
+        LONG e = RegQueryValueExA(hk, values[vi], NULL, &type, data, &dlen);
+        if (e != ERROR_SUCCESS) continue;
+        if (type != REG_MULTI_SZ) continue;
+        if (dlen == 0) continue;
+        /* Guarantee double-NUL termination within bounds. */
+        if (dlen > sizeof data - 2) dlen = sizeof data - 2;
+        data[dlen]     = '\0';
+        data[dlen + 1] = '\0';
+
+        /* Walk the REG_MULTI_SZ: consecutive NUL-terminated strings, ends
+         * with an empty string. */
+        const char *p = (const char *)data;
+        const char *end = (const char *)data + dlen + 1;
+        while (p < end && *p) {
+            lsa_check_provider(c, values[vi], p);
+            size_t n = strnlen(p, (size_t)(end - p));
+            p += n + 1;
+        }
+    }
+    RegCloseKey(hk);
+}
+
+/* ------------------------------------------------------------------ *
  *  Image File Execution Options -- Debugger hijack
  * ------------------------------------------------------------------ */
+
+static bool is_accessibility_image(const char *base);
+
+/* SilentProcessExit persistence: under
+ * HKLM\...\SilentProcessExit\<image>, a MonitorProcess value (paired with
+ * GlobalFlag/ReportingMode) runs a binary when <image> exits (T1546.012-ish
+ * execution-on-exit). Enumerate the key and flag any MonitorProcess. */
+static void scan_silent_exit(ScanCtx *c)
+{
+    static const char *SPE =
+        "Software\\Microsoft\\Windows NT\\CurrentVersion\\SilentProcessExit";
+
+    HKEY hk;
+    LONG rc = RegOpenKeyExA(HKEY_LOCAL_MACHINE, SPE, 0,
+                            KEY_READ | KEY_ENUMERATE_SUB_KEYS, &hk);
+    if (rc != ERROR_SUCCESS) {
+        if (rc == ERROR_ACCESS_DENIED)
+            ctx_note_limit(c, "persist: access denied reading SilentProcessExit");
+        return;   /* ERROR_FILE_NOT_FOUND is normal (key absent on clean) */
+    }
+
+    DWORD idx = 0;
+    for (;;) {
+        char  sub[SC_NAME_LEN];
+        DWORD slen = sizeof sub;
+        LONG e = RegEnumKeyExA(hk, idx, sub, &slen, NULL, NULL, NULL, NULL);
+        if (e == ERROR_NO_MORE_ITEMS) break;
+        idx++;
+        if (e != ERROR_SUCCESS) continue;
+
+        char full[SC_MAX_PATH];
+        snprintf(full, sizeof full, "%s\\%s", SPE, sub);
+
+        char mon[SC_MAX_CMDLINE];
+        if (!read_reg_sz(HKEY_LOCAL_MACHINE, full, "MonitorProcess",
+                         mon, sizeof mon))
+            continue;
+        trim_ws(mon);
+        if (mon[0] == '\0') continue;
+
+        char target[SC_MAX_PATH];
+        extract_target(mon, target, sizeof target);
+        if (target[0] == '\0') {
+            strncpy(target, mon, sizeof target - 1);
+            target[sizeof target - 1] = '\0';
+        }
+        if (allowlist_match(target) || allowlist_match(sub)) continue;
+
+        char reason[128];
+        bool risky = target_is_risky(target, reason, sizeof reason, NULL);
+
+        /* Monitoring an accessibility image on exit is as bad as the IFEO
+         * variant -- treat as CRIT. */
+        bool is_acc = is_accessibility_image(sub);
+        Severity sev = is_acc ? SEV_CRIT : SEV_HIGH;
+        int conf = 80;
+        if (risky && conf < 90) conf = 90;
+        if (is_acc && conf < 90) conf = 90;
+
+        bus_emit(c->bus, "PERSIST.SILENT_EXIT", sev, conf,
+                 ACT_REVIEW, 0, target,
+                 "SilentProcessExit MonitorProcess persistence",
+                 "HKLM\\%s MonitorProcess = \"%s\" (runs when %s exits)%s%s%s",
+                 full, mon, sub,
+                 (risky || is_acc) ? " [" : "",
+                 reason[0] ? reason : (is_acc ? "accessibility image" : ""),
+                 (risky || is_acc) ? "]" : "");
+    }
+    RegCloseKey(hk);
+}
+
+/* True (case-insensitive) when base is a Windows accessibility binary that is
+ * a classic sticky-keys / utilman backdoor target. base may be a bare image
+ * name (IFEO subkey) -- compared against the leaf name. */
+static bool is_accessibility_image(const char *base)
+{
+    static const char *acc[] = {
+        "sethc.exe", "utilman.exe", "osk.exe", "magnify.exe",
+        "narrator.exe", "displayswitch.exe", "atbroker.exe", NULL
+    };
+    /* reduce to leaf name in case a path slipped in */
+    char leaf[SC_NAME_LEN];
+    base_name(base, leaf, sizeof leaf);
+    if (leaf[0] == '\0') {
+        strncpy(leaf, base, sizeof leaf - 1);
+        leaf[sizeof leaf - 1] = '\0';
+    }
+    str_lower(leaf);
+    for (int i = 0; acc[i]; i++)
+        if (strcmp(leaf, acc[i]) == 0) return true;
+    return false;
+}
 
 static void scan_ifeo(ScanCtx *c)
 {
@@ -495,6 +802,21 @@ static void scan_ifeo(ScanCtx *c)
 
         char reason[128];
         target_is_risky(target, reason, sizeof reason, NULL);
+
+        /* A Debugger on an accessibility binary is the classic
+         * sticky-keys / utilman backdoor (T1546.008) -- near-zero FP. */
+        if (is_accessibility_image(sub)) {
+            bus_emit(c->bus, "PERSIST.IFEO_ACCESSIBILITY", SEV_CRIT, 90,
+                     ACT_REVIEW, 0, target[0] ? target : dbg,
+                     "Accessibility binary IFEO Debugger backdoor",
+                     "HKLM\\%s Debugger = \"%s\" (hijacks accessibility "
+                     "binary %s)%s%s%s",
+                     full, dbg, sub,
+                     reason[0] ? " [" : "", reason[0] ? reason : "",
+                     reason[0] ? "]" : "");
+            continue;
+        }
+
         bus_emit(c->bus, "PERSIST.IFEO", SEV_HIGH, 90,
                  ACT_REVIEW, 0, target[0] ? target : dbg,
                  "Image File Execution Options Debugger hijack",
@@ -504,6 +826,8 @@ static void scan_ifeo(ScanCtx *c)
                  reason[0] ? "]" : "");
     }
     RegCloseKey(hk);
+
+    scan_silent_exit(c);
 }
 
 /* ------------------------------------------------------------------ *
@@ -626,24 +950,128 @@ static void scan_startup_folders(ScanCtx *c, bool com_ok)
  *  Scheduled tasks  (System32\Tasks XML walk)
  * ------------------------------------------------------------------ */
 
-/* Pull the text between <tag> and </tag> from a UTF-8 XML buffer.
- * Returns true if found (non-empty trimmed value written to out). */
+/* Produce a sanitized copy of an XML buffer into out[cap]:
+ *   - XML comments  <!-- ... -->        are dropped entirely (so a fake
+ *     <Command> hidden in a comment never reaches the tag scan).
+ *   - CDATA sections <![CDATA[ ... ]]>  are UNWRAPPED -- the literal payload
+ *     is kept (so a real command stored in CDATA IS extracted), with any
+ *     '<','>','&' inside neutralized to spaces so they can't forge tags.
+ * Bounded and crash-safe on truncated/malformed input (unterminated comment
+ * or CDATA just consumes to end-of-buffer). Returns the sanitized buffer
+ * (always NUL-terminated). */
+static void xml_sanitize(const char *xml, char *out, size_t cap)
+{
+    size_t o = 0;
+    if (cap == 0) return;
+    const char *p = xml;
+    while (*p && o < cap - 1) {
+        if (p[0] == '<' && p[1] == '!' && p[2] == '-' && p[3] == '-') {
+            /* skip comment up to the closing "-->" (or EOF) */
+            p += 4;
+            while (*p && !(p[0] == '-' && p[1] == '-' && p[2] == '>')) p++;
+            if (*p) p += 3;            /* consume "-->" */
+            continue;
+        }
+        if (strncmp(p, "<![CDATA[", 9) == 0) {
+            /* unwrap: copy the inner literal, neutralizing markup chars */
+            p += 9;
+            while (*p && !(p[0] == ']' && p[1] == ']' && p[2] == '>') &&
+                   o < cap - 1) {
+                char ch = *p++;
+                if (ch == '<' || ch == '>' || ch == '&') ch = ' ';
+                out[o++] = ch;
+            }
+            if (*p) p += 3;            /* consume "]]>" */
+            continue;
+        }
+        out[o++] = *p++;
+    }
+    out[o] = '\0';
+}
+
+/* Pull the text of the first <tag ...> ... </tag> from an already-sanitized
+ * UTF-8 XML buffer. Tolerates:
+ *   - attributes on the open tag:   <Command xml:space="preserve">
+ *   - an optional namespace prefix: <ns:Command>
+ *   - whitespace around the value (trimmed)
+ * Returns true if found (non-empty trimmed value written to out). Bounded and
+ * safe on malformed/truncated input. */
+static bool xml_find_open(const char *xml, const char *tag, const char **body)
+{
+    size_t tlen = strlen(tag);
+    const char *p = xml;
+    while ((p = strchr(p, '<')) != NULL) {
+        const char *q = p + 1;
+        /* optional namespace prefix: skip "<prefix:" */
+        const char *name = q;
+        const char *colon = NULL;
+        for (const char *r = q; *r && *r != '>' && *r != ' ' &&
+                                 *r != '\t' && *r != '\r' && *r != '\n'; r++) {
+            if (*r == ':') colon = r;
+        }
+        if (colon) name = colon + 1;
+
+        if (strncmp(name, tag, tlen) == 0) {
+            char after = name[tlen];
+            /* the char after the tag name must end the name: '>' closes the
+             * tag, whitespace introduces attributes, '/' is a self-close. */
+            if (after == '>' || after == ' ' || after == '\t' ||
+                after == '\r' || after == '\n' || after == '/') {
+                /* scan to the closing '>' of this open tag */
+                const char *gt = strchr(name + tlen, '>');
+                if (!gt) return false;          /* truncated open tag */
+                if (gt[-1] == '/') {            /* <Command/> -- empty */
+                    p = gt + 1;
+                    continue;
+                }
+                *body = gt + 1;
+                return true;
+            }
+        }
+        p = q;
+    }
+    return false;
+}
+
 static bool xml_extract(const char *xml, const char *tag,
                         char *out, size_t cap)
 {
-    char open[64], close[64];
-    snprintf(open, sizeof open, "<%s>", tag);
-    snprintf(close, sizeof close, "</%s>", tag);
-    const char *s = strstr(xml, open);
-    if (!s) return false;
-    s += strlen(open);
-    const char *e = strstr(s, close);
-    if (!e) return false;
+    /* Sanitize first (drop comments, unwrap CDATA) so hidden/forged tags
+     * can't fool the scan and real CDATA payloads are recovered. Heap to
+     * keep the stack frame small (called per task file). */
+    char *clean = (char *)malloc(1 << 16);
+    if (!clean) return false;
+    xml_sanitize(xml, clean, 1 << 16);
+
+    const char *s = NULL;
+    if (!xml_find_open(clean, tag, &s)) { free(clean); return false; }
+
+    /* End: the matching close tag, allowing a namespace prefix.
+     * Search for "</...tag>" -- accept "</tag>" or "</ns:tag>". */
+    const char *e = NULL;
+    const char *scan = s;
+    size_t tlen = strlen(tag);
+    while ((scan = strstr(scan, "</")) != NULL) {
+        const char *n = scan + 2;
+        const char *colon = NULL;
+        for (const char *r = n; *r && *r != '>'; r++)
+            if (*r == ':') colon = r;
+        const char *nm = colon ? colon + 1 : n;
+        if (strncmp(nm, tag, tlen) == 0 &&
+            (nm[tlen] == '>' || nm[tlen] == ' ' || nm[tlen] == '\t')) {
+            e = scan;
+            break;
+        }
+        scan += 2;
+    }
+    if (!e) { free(clean); return false; }
+
     size_t len = (size_t)(e - s);
     if (len >= cap) len = cap - 1;
     memcpy(out, s, len);
     out[len] = '\0';
     trim_ws(out);
+    free(clean);
     return out[0] != '\0';
 }
 
@@ -1008,6 +1436,253 @@ static void scan_com_hijack(ScanCtx *c)
 }
 
 /* ------------------------------------------------------------------ *
+ *  Services written directly in the registry  (T1543.003)
+ * ------------------------------------------------------------------ *
+ *
+ * scan_service.c only sees what the SCM enumerates (EnumServicesStatusEx).
+ * Malware can drop a service straight under
+ *   HKLM\SYSTEM\CurrentControlSet\Services\<name>
+ * with a malicious ImagePath + Start type. A boot/system-start driver or a
+ * service that has not yet been started can be missed or under-inspected by
+ * the SCM view. Here we walk the registry side directly. Only genuinely
+ * off-profile binaries are emitted, so the thousands of legitimate inbox
+ * drivers/services stay quiet.
+ */
+
+/* Map a Start REG_DWORD to its canonical name. */
+static const char *svc_start_name(DWORD start)
+{
+    switch (start) {
+        case 0:  return "boot";      /* SERVICE_BOOT_START   */
+        case 1:  return "system";    /* SERVICE_SYSTEM_START */
+        case 2:  return "auto";      /* SERVICE_AUTO_START   */
+        case 3:  return "demand";    /* SERVICE_DEMAND_START */
+        case 4:  return "disabled";  /* SERVICE_DISABLED     */
+        default: return "unknown";
+    }
+}
+
+/* Resolve a service ImagePath (which uses NT-native conventions) to a real
+ * Win32 path for sign/path classification. Handles:
+ *   \SystemRoot\System32\drivers\x.sys      -> %WINDIR%\System32\drivers\x.sys
+ *   \??\C:\path\x.exe                        -> C:\path\x.exe
+ *   system32\drivers\x.sys  (relative)       -> %WINDIR%\System32\drivers\x.sys
+ *   "C:\path\x.exe" -args                    -> C:\path\x.exe (via extract_target)
+ * Env vars are expanded first.  Writes a bounded result to out[cap]. */
+static void resolve_svc_imagepath(const char *raw, char *out, size_t cap)
+{
+    out[0] = '\0';
+    if (cap == 0) return;
+
+    char expanded[SC_MAX_CMDLINE];
+    expand_env(raw, expanded, sizeof expanded);
+    trim_ws(expanded);
+    strip_quotes(expanded);
+    trim_ws(expanded);
+    if (expanded[0] == '\0') return;
+
+    char base[MAX_PATH];
+    UINT wn = GetWindowsDirectoryA(base, sizeof base);
+    if (wn == 0 || wn >= sizeof base) {
+        strncpy(base, "C:\\Windows", sizeof base - 1);
+        base[sizeof base - 1] = '\0';
+    }
+
+    /* Build a normalized leading-path form, then hand it to extract_target()
+     * to peel off arguments and isolate the binary. A real Win32 path fits in
+     * SC_MAX_PATH; the tail we splice in is bounded to keep the result well
+     * inside that and avoid any format-truncation. */
+    char norm[SC_MAX_CMDLINE];   /* roomy: base(MAX_PATH) + tail(SC_MAX_PATH) */
+
+    /* case-insensitive prefix tests on a lowercased copy */
+    char low[SC_MAX_CMDLINE];
+    strncpy(low, expanded, sizeof low - 1);
+    low[sizeof low - 1] = '\0';
+    str_lower(low);
+
+    /* bounded tail buffer: whatever we append after a base dir */
+    char tail[SC_MAX_PATH];
+
+    if (strncmp(low, "\\systemroot\\", 12) == 0) {
+        /* \SystemRoot\<rest> -> %WINDIR%\<rest> */
+        strncpy(tail, expanded + 12, sizeof tail - 1);
+        tail[sizeof tail - 1] = '\0';
+        snprintf(norm, sizeof norm, "%s\\%s", base, tail);
+    } else if (strncmp(low, "\\??\\", 4) == 0) {
+        /* \??\C:\... -> C:\... */
+        strncpy(norm, expanded + 4, sizeof norm - 1);
+        norm[sizeof norm - 1] = '\0';
+    } else if (strncmp(low, "system32\\", 9) == 0 ||
+               strncmp(low, "\\system32\\", 10) == 0) {
+        /* relative to %WINDIR% (driver convention) */
+        strncpy(tail, (expanded[0] == '\\') ? expanded + 1 : expanded,
+                sizeof tail - 1);
+        tail[sizeof tail - 1] = '\0';
+        snprintf(norm, sizeof norm, "%s\\%s", base, tail);
+    } else if (expanded[1] == ':' && (expanded[2] == '\\' || expanded[2] == '/')) {
+        /* already a drive-absolute path */
+        strncpy(norm, expanded, sizeof norm - 1);
+        norm[sizeof norm - 1] = '\0';
+    } else if (expanded[0] == '\\') {
+        /* some other NT path (\Driver\..., \Device\...); leave as-is, it
+         * won't resolve to a file and will be treated as non-existent */
+        strncpy(norm, expanded, sizeof norm - 1);
+        norm[sizeof norm - 1] = '\0';
+    } else {
+        /* bare relative name: assume a driver under System32\drivers */
+        strncpy(tail, expanded, sizeof tail - 1);
+        tail[sizeof tail - 1] = '\0';
+        snprintf(norm, sizeof norm, "%s\\System32\\drivers\\%s", base, tail);
+    }
+
+    /* Peel arguments / isolate the binary token. */
+    extract_target(norm, out, cap);
+    if (out[0] == '\0') {
+        size_t nn = strlen(norm);
+        if (nn >= cap) nn = cap - 1;
+        memcpy(out, norm, nn);
+        out[nn] = '\0';
+    }
+}
+
+static void scan_svc_registry(ScanCtx *c)
+{
+    static const char *SERVICES = "SYSTEM\\CurrentControlSet\\Services";
+
+    HKEY hk;
+    LONG rc = RegOpenKeyExA(HKEY_LOCAL_MACHINE, SERVICES, 0,
+                            KEY_READ | KEY_ENUMERATE_SUB_KEYS, &hk);
+    if (rc != ERROR_SUCCESS) {
+        if (rc == ERROR_ACCESS_DENIED)
+            ctx_note_limit(c, "persist: access denied reading Services");
+        return;
+    }
+
+    DWORD idx = 0;
+    for (; idx < 8192; ) {     /* defensive cap */
+        char  sub[SC_NAME_LEN];
+        DWORD slen = sizeof sub;
+        LONG e = RegEnumKeyExA(hk, idx, sub, &slen, NULL, NULL, NULL, NULL);
+        if (e == ERROR_NO_MORE_ITEMS) break;
+        idx++;
+        if (e != ERROR_SUCCESS) continue;
+
+        /* Open the per-service subkey for its values. */
+        char subpath[SC_MAX_PATH];
+        snprintf(subpath, sizeof subpath, "%s\\%s", SERVICES, sub);
+
+        HKEY shk;
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, subpath, 0, KEY_READ, &shk)
+            != ERROR_SUCCESS)
+            continue;
+
+        /* ImagePath (REG_SZ / REG_EXPAND_SZ). Absent for many group/no-binary
+         * keys -- skip those silently. */
+        BYTE  data[SC_MAX_CMDLINE];
+        DWORD dlen = sizeof data;
+        DWORD type = 0;
+        LONG  ie = RegQueryValueExA(shk, "ImagePath", NULL, &type, data, &dlen);
+        if (ie != ERROR_SUCCESS ||
+            (type != REG_SZ && type != REG_EXPAND_SZ) || dlen == 0) {
+            RegCloseKey(shk);
+            continue;
+        }
+        data[(dlen < sizeof data) ? dlen : sizeof data - 1] = '\0';
+        data[sizeof data - 1] = '\0';
+
+        char raw[SC_MAX_CMDLINE];
+        if (type == REG_EXPAND_SZ)
+            expand_env((const char *)data, raw, sizeof raw);
+        else { strncpy(raw, (const char *)data, sizeof raw - 1);
+               raw[sizeof raw - 1] = '\0'; }
+        trim_ws(raw);
+        if (raw[0] == '\0') { RegCloseKey(shk); continue; }
+
+        /* Start + Type (REG_DWORD, may be absent). */
+        DWORD start = (DWORD)-1, vlen = sizeof(DWORD), vt = 0;
+        if (RegQueryValueExA(shk, "Start", NULL, &vt, (BYTE *)&start, &vlen)
+                != ERROR_SUCCESS || vt != REG_DWORD)
+            start = (DWORD)-1;
+
+        DWORD svctype = (DWORD)-1; vlen = sizeof(DWORD); vt = 0;
+        if (RegQueryValueExA(shk, "Type", NULL, &vt, (BYTE *)&svctype, &vlen)
+                != ERROR_SUCCESS || vt != REG_DWORD)
+            svctype = (DWORD)-1;
+
+        RegCloseKey(shk);
+
+        /* Resolve to a real binary on disk. */
+        char target[SC_MAX_PATH];
+        resolve_svc_imagepath(raw, target, sizeof target);
+        if (target[0] == '\0') continue;
+
+        /* Classify signer + path. */
+        SignVerdict v = SIGN_UNKNOWN;
+        bool exists = (GetFileAttributesA(target) != INVALID_FILE_ATTRIBUTES);
+        if (exists) v = sign_verify(target, NULL, 0);
+
+        PathLoc loc = path_classify(target);
+        bool user_writable = path_is_user_writable(target);
+        bool signed_ms     = (v == SIGN_SIGNED_MS);
+        bool unsigned_bad  = (v == SIGN_UNSIGNED || v == SIGN_INVALID);
+        bool in_inbox_dir  = (loc == PATHLOC_SYSTEM || loc == PATHLOC_WINDOWS);
+
+        /* SUPPRESS the legitimate inbox population: an MS-signed binary under
+         * System32 / System32\drivers / WinSxS (all PATHLOC_SYSTEM, with
+         * WINDOWS as a near-inbox sibling) is the clean state. Do not emit. */
+        if (signed_ms && in_inbox_dir)
+            continue;
+
+        /* Decide whether this service binary is genuinely suspicious:
+         *   - sits in a user-writable / temp / AppData / ProgramData path, OR
+         *   - is unsigned/invalid AND lives outside the MS inbox dirs.
+         * Everything else (e.g. validly third-party-signed under Program
+         * Files) is left to scan_service / other vantage points -- not flagged
+         * here, to keep registry-view volume low. */
+        /* A validly signed binary (MS or trusted third party) is exonerated
+         * even from a user-writable path: Microsoft Defender runs from a
+         * versioned %ProgramData% dir, Store apps from WindowsApps, etc. Only
+         * an UNSIGNED binary sitting in a user-writable path is the malware
+         * shape. (Same lesson as scan_service.c's Defender false positive.) */
+        bool validly_signed = (v == SIGN_SIGNED || v == SIGN_SIGNED_MS);
+        const char *why = NULL;
+        if (user_writable && !validly_signed) {
+            why = (loc == PATHLOC_TEMP)  ? "ImagePath in temp" :
+                  (loc == PATHLOC_USER_WRITABLE) ?
+                      "ImagePath in user-writable (AppData/ProgramData/Public)" :
+                  "ImagePath in user-writable location";
+        } else if (unsigned_bad && !in_inbox_dir) {
+            why = (v == SIGN_INVALID) ? "invalid signature outside inbox dirs"
+                                      : "unsigned outside inbox dirs";
+        } else if (!exists) {
+            /* Binary referenced by the service does not exist on disk: either
+             * a stale entry or a dropper that has not yet staged the payload.
+             * Only call it out when it ALSO claims an early Start type, which
+             * is what a not-yet-started boot/system driver would look like. */
+            if (start == 0 || start == 1)
+                why = "ImagePath missing on disk (early-start service)";
+        }
+
+        if (!why) continue;     /* off-profile only -- keep it quiet otherwise */
+
+        /* Severity: HIGH, escalate to CRIT when unsigned AND user-writable
+         * (the strongest direct-write malware signal). */
+        Severity sev = SEV_HIGH;
+        if (unsigned_bad && user_writable) sev = SEV_CRIT;
+
+        bus_emit(c->bus, "PERSIST.SVC_REGISTRY", sev, 80,
+                 ACT_REVIEW, 0, target,
+                 "Service defined directly in registry (off-profile binary)",
+                 "HKLM\\%s\\%s ImagePath=\"%s\" Start=%s Type=0x%lx -> %s "
+                 "[%s; %s] (registry view; SCM may not enumerate this)",
+                 SERVICES, sub, raw, svc_start_name(start),
+                 (svctype == (DWORD)-1) ? 0ul : (unsigned long)svctype,
+                 target, sign_name(v), why);
+    }
+    RegCloseKey(hk);
+}
+
+/* ------------------------------------------------------------------ *
  *  entry point
  * ------------------------------------------------------------------ */
 
@@ -1042,8 +1717,11 @@ void scan_persist(ScanCtx *c)
     scan_run_keys(c);
     scan_winlogon(c);
     scan_appinit(c);
+    scan_appcert(c);
+    scan_lsa_providers(c);
     scan_ifeo(c);
     scan_com_hijack(c);
+    scan_svc_registry(c);
 
     /* Filesystem-based checks. */
     scan_startup_folders(c, com_ok);

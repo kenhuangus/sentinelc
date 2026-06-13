@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <io.h>      /* _isatty / _fileno for the progress heartbeat */
 
 /* ------------------------------------------------------------------ */
 /* CLI helpers                                                         */
@@ -236,8 +237,11 @@ static int parse_cli(int argc, char **argv, Config *cfg)
 typedef void (*ScanFn)(ScanCtx *);
 
 typedef struct {
-    ScanFn  fn;
-    ScanCtx *ctx;
+    ScanFn       fn;
+    ScanCtx     *ctx;
+    const char  *name;     /* scanner label for the progress heartbeat */
+    ULONGLONG    start;    /* GetTickCount64 at submit */
+    volatile LONG done;    /* set to 1 by the worker when finished */
 } ScanJob;
 
 static VOID CALLBACK scan_work_cb(PTP_CALLBACK_INSTANCE inst,
@@ -249,11 +253,40 @@ static VOID CALLBACK scan_work_cb(PTP_CALLBACK_INSTANCE inst,
     ScanJob *job = (ScanJob *)context;
     if (job && job->fn && job->ctx)
         job->fn(job->ctx);
+    if (job)
+        InterlockedExchange(&job->done, 1);
 }
 
+/* True if stderr is an interactive console. Phase/progress output is written to
+ * stderr and gated on this, so it never pollutes --json (stdout) or a redirected
+ * log, but shows live when you run a scan in a real terminal. */
+static bool phase_tty(void)
+{
+    return _isatty(_fileno(stderr)) != 0;
+}
+
+/* One stderr status line, rewritable via carriage-return, only on a TTY.
+ * We pad with trailing spaces to overwrite any longer previous line, which
+ * works on every console without needing VT escape support. */
+#define PHASE_WIDTH 100
+static void phase_emit(const char *s, bool newline)
+{
+    if (!phase_tty()) return;
+    char buf[PHASE_WIDTH + 8];
+    int n = snprintf(buf, sizeof buf, "%-*.*s", PHASE_WIDTH, PHASE_WIDTH, s);
+    (void)n;
+    fprintf(stderr, "\r%s%s", buf, newline ? "\n" : "");
+    fflush(stderr);
+}
+
+static void phase_line(const char *s)      { phase_emit(s, false); }
+static void phase_done_line(const char *s) { phase_emit(s, true); }
+
 /* Run a set of scanners concurrently. Falls back to sequential if the pool
- * cannot be created. scan_process must already have completed. */
-static void run_scanners_parallel(ScanCtx *ctx, ScanFn *fns, size_t n)
+ * cannot be created. scan_process must already have completed. names[i] labels
+ * fns[i] for the progress heartbeat (may be NULL). */
+static void run_scanners_parallel(ScanCtx *ctx, ScanFn *fns,
+                                  const char **names, size_t n)
 {
     if (n == 0)
         return;
@@ -273,16 +306,47 @@ static void run_scanners_parallel(ScanCtx *ctx, ScanFn *fns, size_t n)
     for (size_t i = 0; i < n; i++) {
         if (!fns[i])
             continue;
-        jobs[submitted].fn  = fns[i];
-        jobs[submitted].ctx = ctx;
+        jobs[submitted].fn    = fns[i];
+        jobs[submitted].ctx   = ctx;
+        jobs[submitted].name  = (names && names[i]) ? names[i] : "scanner";
+        jobs[submitted].start = GetTickCount64();
+        jobs[submitted].done  = 0;
         works[submitted] = CreateThreadpoolWork(scan_work_cb, &jobs[submitted], NULL);
         if (!works[submitted]) {
             /* pool work creation failed: run this one inline now */
             fns[i](ctx);
+            jobs[submitted].done = 1;
             continue;
         }
         SubmitThreadpoolWork(works[submitted]);
         submitted++;
+    }
+
+    /* Heartbeat: poll the done flags and show which scanners are still running,
+     * with elapsed time, so a slow or hung scanner is obvious. TTY-gated. */
+    ULONGLONG last = 0;
+    for (;;) {
+        size_t remaining = 0;
+        for (size_t i = 0; i < submitted; i++)
+            if (!jobs[i].done) remaining++;
+        if (remaining == 0)
+            break;
+        ULONGLONG now = GetTickCount64();
+        if (phase_tty() && now - last >= 1000) {   /* refresh ~1/s */
+            char line[512];
+            int off = snprintf(line, sizeof line, "  scanning (%zu running):",
+                               remaining);
+            for (size_t i = 0; i < submitted && off > 0 && off < (int)sizeof line; i++) {
+                if (jobs[i].done) continue;
+                unsigned secs = (unsigned)((now - jobs[i].start) / 1000);
+                off += snprintf(line + off, sizeof line - (size_t)off,
+                                " %s(%us%s)", jobs[i].name, secs,
+                                secs >= 20 ? " SLOW" : "");
+            }
+            phase_line(line);
+            last = now;
+        }
+        Sleep(120);
     }
 
     for (size_t i = 0; i < submitted; i++) {
@@ -291,6 +355,7 @@ static void run_scanners_parallel(ScanCtx *ctx, ScanFn *fns, size_t n)
             CloseThreadpoolWork(works[i]);
         }
     }
+    phase_done_line("  scanners complete.");
 
     free(jobs);
     free(works);
@@ -382,19 +447,29 @@ int main(int argc, char **argv)
         scan_path(&ctx);
     } else {
         /* scan_process FIRST and to completion: it fills ctx->procs. */
+        phase_line("  scanning processes...");
+        ULONGLONG p0 = GetTickCount64();
         scan_process(&ctx);
+        {
+            char d[64];
+            snprintf(d, sizeof d, "  processes done (%us).",
+                     (unsigned)((GetTickCount64() - p0) / 1000));
+            phase_done_line(d);
+        }
 
         /* remaining scanners run concurrently */
         ScanFn fns[8];
+        const char *names[8];
         size_t n = 0;
-        fns[n++] = scan_service;
-        fns[n++] = scan_persist;
-        fns[n++] = scan_network;
+        fns[n] = scan_service;  names[n] = "service";    n++;
+        fns[n] = scan_persist;  names[n] = "persistence"; n++;
+        fns[n] = scan_network;  names[n] = "network";     n++;
         if (cfg.full) {
-            fns[n++] = scan_keylog;
-            fns[n++] = scan_rootkit;
+            fns[n] = scan_keylog;  names[n] = "keylogger"; n++;
+            fns[n] = scan_rootkit; names[n] = "rootkit";   n++;
+            fns[n] = scan_creds;   names[n] = "cred-access"; n++;
         }
-        run_scanners_parallel(&ctx, fns, n);
+        run_scanners_parallel(&ctx, fns, names, n);
     }
 
     /* ---- correlate, report, respond ---- */

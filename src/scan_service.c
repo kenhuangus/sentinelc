@@ -460,6 +460,31 @@ static void inspect_service(ScanCtx *c, SC_HANDLE scm, const char *name,
                      start_type_name(start_type));
         }
 
+        /* SVC.UNVERIFIED -- the resolved, existing service binary verified as
+         * SIGN_UNKNOWN ("could not verify": file locked, catalog context
+         * unavailable, verify error) and is NOT a Microsoft inbox path. Audit
+         * H4: an un-verifiable service binary must not be silently treated as
+         * clean. Weak positive: lower confidence than a confirmed SVC.UNSIGNED
+         * (which is >=60) and SEV_LOW. The SIGN_SIGNED_MS exemption for
+         * user-writable Defender paths and the is_inbox_path suppression both
+         * still apply (SIGN_UNKNOWN != SIGN_SIGNED_MS, and inbox paths are
+         * excluded here). */
+        if (sv == SIGN_UNKNOWN && binary[0] && binary_exists &&
+            !is_inbox_path(binary)) {
+            int conf = 35;
+            if (start_type == SERVICE_AUTO_START ||
+                start_type == SERVICE_BOOT_START ||
+                start_type == SERVICE_SYSTEM_START)
+                conf += 10;
+            bus_emit(c->bus, "SVC.UNVERIFIED", SEV_LOW, conf,
+                     ACT_DISABLE_SVC, pid, target,
+                     "Service binary signature could not be verified",
+                     "service '%s' (%s) binary %s: signature could not be "
+                     "verified [start=%s] -- treated as suspicious-pending, "
+                     "not clean",
+                     name, disp, binary, start_type_name(start_type));
+        }
+
         /* SVC.UNQUOTED_PATH -- raw image path has a space and isn't quoted */
         if (!had_quote && unquoted_space) {
             bus_emit(c->bus, "SVC.UNQUOTED_PATH", SEV_LOW, 55,

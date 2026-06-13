@@ -148,6 +148,118 @@ static bool is_lolbin_child(const char *name)
 }
 
 /* ------------------------------------------------------------------ */
+/* command-line inspection (defensive detection of proxy-execution     */
+/* and obfuscated PowerShell -- the binary is often signed, so the     */
+/* signature/path rules miss it; the giveaway is the argument shape).  */
+/* ------------------------------------------------------------------ */
+
+/* Signed Microsoft binaries commonly abused to run attacker content. */
+static bool is_lolbin_name(const char *name)
+{
+    static const char *names[] = {
+        "rundll32.exe", "regsvr32.exe", "mshta.exe", "msiexec.exe",
+        "installutil.exe", "regasm.exe", "regsvcs.exe", "msbuild.exe",
+        "cscript.exe", "wscript.exe", "certutil.exe", "bitsadmin.exe"
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        if (_stricmp(name, names[i]) == 0)
+            return true;
+    return false;
+}
+
+/* True if the command line carries an indicator that the LOLBin is fetching
+ * or executing external / user-writable content. Conservative: a normal
+ * "rundll32 shell32.dll,Control_RunDLL" trips none of these. *strong is set
+ * for the high-confidence indicators (remote fetch / scriptlet). */
+static bool lolbin_arg_suspicious(const char *cmd, bool *strong)
+{
+    if (strong) *strong = false;
+    if (!cmd || !cmd[0]) return false;
+    bool hit = false, st = false;
+    const char *remote[] = { "http://", "https://", "ftp://", "scrobj.dll",
+                             "javascript:", "vbscript:" };
+    for (size_t i = 0; i < sizeof(remote) / sizeof(remote[0]); i++)
+        if (str_icontains(cmd, remote[i])) { hit = true; st = true; }
+    const char *writ[] = { "\\appdata\\", "\\temp\\", "\\programdata\\",
+                           "\\users\\public\\", "\\downloads\\" };
+    for (size_t i = 0; i < sizeof(writ) / sizeof(writ[0]); i++)
+        if (str_icontains(cmd, writ[i])) hit = true;
+    const char *mark[] = { "frombase64", "downloadstring", "urlcache",
+                           "/transfer", "invoke-expression", " -enc" };
+    for (size_t i = 0; i < sizeof(mark) / sizeof(mark[0]); i++)
+        if (str_icontains(cmd, mark[i])) hit = true;
+    if (strong) *strong = st;
+    return hit;
+}
+
+static bool is_powershell_name(const char *name)
+{
+    return _stricmp(name, "powershell.exe") == 0 ||
+           _stricmp(name, "pwsh.exe") == 0;
+}
+
+/* case-insensitive substring search returning a pointer into hay, or NULL. */
+static const char *ci_find(const char *hay, const char *needle)
+{
+    if (!hay || !needle || !needle[0]) return NULL;
+    size_t nl = strlen(needle);
+    for (const char *p = hay; *p; p++)
+        if (_strnicmp(p, needle, nl) == 0)
+            return p;
+    return NULL;
+}
+
+/* Standard base64 decode. Tolerant: skips whitespace and non-alphabet bytes,
+ * stops at '='. Returns bytes written (<= out_cap). Malformed input yields a
+ * short/empty result, never a crash. Single-threaded caller (scan_process
+ * phase 2), so the lazy table init needs no lock. */
+static size_t b64_decode(const char *in, unsigned char *out, size_t out_cap)
+{
+    static signed char T[256];
+    static bool inited = false;
+    if (!inited) {
+        for (int i = 0; i < 256; i++) T[i] = -1;
+        const char *a = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                        "abcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < 64; i++) T[(unsigned char)a[i]] = (signed char)i;
+        inited = true;
+    }
+    unsigned int acc = 0;
+    int nbits = 0;
+    size_t o = 0;
+    for (const char *p = in; *p; p++) {
+        unsigned char ch = (unsigned char)*p;
+        if (ch == '=') break;
+        signed char v = T[ch];
+        if (v < 0) continue;
+        acc = (acc << 6) | (unsigned)v;
+        nbits += 6;
+        if (nbits >= 8) {
+            nbits -= 8;
+            if (o < out_cap) out[o++] = (unsigned char)((acc >> nbits) & 0xFF);
+            else break;
+        }
+    }
+    return o;
+}
+
+/* Pull the base64 token that follows a -enc / -encodedcommand flag. */
+static bool extract_enc_token(const char *cmd, char *out, size_t cap)
+{
+    const char *e = ci_find(cmd, "-encodedcommand");
+    size_t skip = 15;
+    if (!e) { e = ci_find(cmd, "-enc"); skip = 4; }
+    if (!e) return false;
+    const char *p = e + skip;
+    while (*p == ' ' || *p == '\t' || *p == ':' || *p == '=') p++;
+    size_t o = 0;
+    while (*p && *p != ' ' && *p != '\t' && o + 1 < cap)
+        out[o++] = *p++;
+    out[o] = '\0';
+    return o > 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* per-process detail collection                                       */
 /* ------------------------------------------------------------------ */
 
@@ -323,8 +435,14 @@ static bool walk_memory_suspicious(HANDLE proc)
 /* ------------------------------------------------------------------ */
 
 /* Fill one ProcRec slot for the given pid/ppid/name. Opens the process for
- * deep inspection where allowed. Returns true if it could open it. */
-static bool fill_proc(ScanCtx *c, DWORD pid, DWORD ppid, const char *name)
+ * deep inspection where allowed. Returns true if it could open it.
+ *
+ * create_time is the process CreateTime as a FILETIME u64 (0 if the caller
+ * could not obtain it cheaply, e.g. the Toolhelp path). When the ntdll path
+ * supplies it, that value is preferred; otherwise we try GetProcessTimes on
+ * the opened handle as a backup. */
+static bool fill_proc(ScanCtx *c, DWORD pid, DWORD ppid, const char *name,
+                      uint64_t create_time)
 {
     ProcRec *r = proctable_add(c->procs);
     if (!r)
@@ -334,6 +452,7 @@ static bool fill_proc(ScanCtx *c, DWORD pid, DWORD ppid, const char *name)
     r->ppid = ppid;
     copy_bounded(r->name, sizeof(r->name), name);
     r->accessible = false;
+    r->create_time = create_time;
 
     /* PID 0 (System Idle) and 4 (System) cannot be meaningfully opened. */
     if (pid == 0 || pid == 4)
@@ -349,6 +468,19 @@ static bool fill_proc(ScanCtx *c, DWORD pid, DWORD ppid, const char *name)
     }
 
     r->accessible = true;
+
+    /* Backup CreateTime via GetProcessTimes if the ntdll value was unavailable
+     * (e.g. Toolhelp path). The ntdll struct value is preferred and free, so we
+     * only do this when create_time is still 0. */
+    if (r->create_time == 0) {
+        FILETIME ftCreate, ftExit, ftKernel, ftUser;
+        if (GetProcessTimes(h, &ftCreate, &ftExit, &ftKernel, &ftUser)) {
+            ULARGE_INTEGER u;
+            u.LowPart  = ftCreate.dwLowDateTime;
+            u.HighPart = ftCreate.dwHighDateTime;
+            r->create_time = (uint64_t)u.QuadPart;
+        }
+    }
 
     if (get_image_path(h, r->image_path, sizeof(r->image_path))) {
         /* If name was empty (Toolhelp gave nothing), derive from path. */
@@ -450,7 +582,8 @@ static bool enum_via_ntdll(ScanCtx *c, size_t *inaccessible, size_t *total)
             copy_bounded(name, sizeof(name), "System Idle Process");
         }
 
-        bool opened = fill_proc(c, pid, ppid, name);
+        uint64_t create_time = (uint64_t)spi->CreateTime.QuadPart;
+        bool opened = fill_proc(c, pid, ppid, name, create_time);
         count++;
         if (!opened && pid != 0 && pid != 4)
             denied++;
@@ -489,7 +622,9 @@ static bool enum_via_toolhelp(ScanCtx *c, size_t *inaccessible, size_t *total)
 
             DWORD pid  = pe.th32ProcessID;
             DWORD ppid = pe.th32ParentProcessID;
-            bool opened = fill_proc(c, pid, ppid, name);
+            /* Toolhelp gives no CreateTime cheaply; pass 0 (fill_proc will try
+             * GetProcessTimes as a backup on the opened handle). */
+            bool opened = fill_proc(c, pid, ppid, name, 0);
             count++;
             if (!opened && pid != 0 && pid != 4)
                 denied++;
@@ -526,7 +661,18 @@ static void emit_for_proc(ScanCtx *c, ProcRec *r)
 
     bool unsigned_bad = (r->sign_state == SIGN_UNSIGNED ||
                          r->sign_state == SIGN_INVALID);
+    /* A validly-signed image (signed, or signed-by-MS) is the ONLY true
+     * exoneration. SIGN_UNKNOWN ("could not verify": file locked, catalog
+     * context unavailable, WinVerifyTrust errored for a non-signature reason)
+     * is NOT exoneration -- in security-relevant locations it is treated as a
+     * weak positive below. */
+    bool signed_ok = (r->sign_state == SIGN_SIGNED ||
+                      r->sign_state == SIGN_SIGNED_MS);
+    /* Could-not-verify: only meaningful when we actually had an image to check. */
+    bool sig_unverifiable = r->image_path[0] && (r->sign_state == SIGN_UNKNOWN);
     bool user_writable = r->image_path[0] && path_is_user_writable(r->image_path);
+    bool in_system = r->image_path[0] &&
+                     path_classify(r->image_path) == PATHLOC_SYSTEM;
 
     PeInfo pe;
     bool have_pe = false;
@@ -565,14 +711,31 @@ static void emit_for_proc(ScanCtx *c, ProcRec *r)
     }
 
     /* PROC.UNSIGNED_SYS32 -- unsigned/invalid image that claims a system dir */
-    if (unsigned_bad && r->image_path[0] &&
-        path_classify(r->image_path) == PATHLOC_SYSTEM) {
+    if (unsigned_bad && in_system) {
         bus_emit(c->bus, "PROC.UNSIGNED_SYS32", SEV_MED, conf_clamp(70),
                  ACT_REVIEW, r->pid, target,
                  "Unsigned image in a system directory",
                  "%s (pid %lu) at %s is %s but resides in a system directory",
                  r->name, (unsigned long)r->pid, r->image_path,
                  sign_name((SignVerdict)r->sign_state));
+    }
+
+    /* PROC.UNVERIFIED_SIG -- "could not verify" (SIGN_UNKNOWN) in a
+     * security-relevant location. Audit finding H4: an un-checkable system
+     * image (or one in a user-writable path) must NOT be silently treated as
+     * clean. This is a WEAK positive: lower confidence than a confirmed-unsigned
+     * (PROC.UNSIGNED_SYS32 above is conf 70), and we only emit in security-
+     * relevant locations to avoid noise. Validly-signed images never reach here
+     * (sig_unverifiable requires SIGN_UNKNOWN). */
+    if (sig_unverifiable && (in_system || user_writable)) {
+        bus_emit(c->bus, "PROC.UNVERIFIED_SIG", SEV_LOW, conf_clamp(40),
+                 ACT_REVIEW, r->pid, target,
+                 "Image signature could not be verified",
+                 "%s (pid %lu) at %s: signature could not be verified "
+                 "(file locked / catalog context unavailable / verify error); "
+                 "image lives in a %s -- treated as suspicious-pending, not clean",
+                 r->name, (unsigned long)r->pid, r->image_path,
+                 in_system ? "system directory" : "user-writable path");
     }
 
     /* PROC.RWX_MEM -- private RWX / unbacked executable memory.
@@ -586,13 +749,15 @@ static void emit_for_proc(ScanCtx *c, ProcRec *r)
      * with RWX memory is normal -> suppressed (logged at INFO, not a threat). */
     if (r->suspicious_mem) {
         bool masquerade = r->image_path[0] && name_is_masquerade(r->image_path);
-        bool signed_ok  = (r->sign_state == SIGN_SIGNED ||
-                           r->sign_state == SIGN_SIGNED_MS);
-        /* A valid signature is a strong exoneration: a signed app living in
-         * AppData (PowerToys, VS Code, Slack, Teams) with RWX memory is normal.
-         * Treat user-writable path as corroborating ONLY when the image is not
-         * validly signed. Unsigned/invalid or masquerade always corroborate. */
-        bool corroborated = unsigned_bad || masquerade ||
+        /* A valid signature is the ONLY strong exoneration: a signed app living
+         * in AppData (PowerToys, VS Code, Slack, Teams) with RWX memory is
+         * normal. SIGN_UNKNOWN ("could not verify") does NOT exonerate (audit
+         * H4): a process we could not verify that ALSO has RWX/unbacked memory,
+         * or runs from a user-writable path, is still corroborated. So a
+         * user-writable path corroborates whenever the image is not validly
+         * signed (i.e. unsigned, invalid, OR unverifiable). Unsigned/invalid,
+         * masquerade, or an unverifiable signature always corroborate. */
+        bool corroborated = unsigned_bad || masquerade || sig_unverifiable ||
                             (user_writable && !signed_ok);
 
         if (corroborated) {
@@ -656,6 +821,108 @@ static void emit_for_proc(ScanCtx *c, ProcRec *r)
                      "classic macro/script-to-shell chain",
                      r->name, (unsigned long)r->pid,
                      parent->name, (unsigned long)r->ppid);
+        }
+    }
+
+    /* PROC.PPID_SPOOF -- parent-PID spoofing via PROC_THREAD_ATTRIBUTE_PARENT_
+     * PROCESS (T1134.004). The existing SUSPICIOUS_PARENT rule trusts the
+     * kernel's InheritedFromUniqueProcessId, which an attacker forges with
+     * UpdateProcThreadAttribute so a malicious child appears to descend from a
+     * benign parent (e.g. explorer.exe). The one invariant an attacker cannot
+     * forge is time: a real parent must exist BEFORE it spawns a child. So if
+     * the child's CreateTime predates the claimed parent's CreateTime, the
+     * claimed parent could not have created it -- the lineage is fabricated (or
+     * the ppid is a reused PID now pointing at a newer unrelated process; either
+     * way it is worth flagging).
+     *
+     * Anti-FP guards: skip if either CreateTime is unknown (0); skip the system
+     * pseudo-PIDs 0/4 (handled at the top of this function); allowlisted images
+     * are already returned-early above. We require the inversion to exceed a
+     * ~1 second margin (10,000,000 FILETIME ticks) so clock-resolution noise and
+     * legitimate near-simultaneous fast spawns do not false-positive. */
+    {
+        const uint64_t PPID_SPOOF_MARGIN = 10000000ULL; /* ~1s in 100ns ticks */
+        if (r->create_time != 0) {
+            ProcRec *cp = proctable_find(c->procs, r->ppid);
+            if (cp && cp->pid != 0 && cp->pid != 4 && cp->create_time != 0 &&
+                r->create_time + PPID_SPOOF_MARGIN < cp->create_time) {
+                bus_emit(c->bus, "PROC.PPID_SPOOF", SEV_HIGH, conf_clamp(75),
+                         ACT_REVIEW, r->pid, target,
+                         "Parent-PID spoofing (child older than claimed parent)",
+                         "%s (pid %lu, create_time %llu) predates its claimed "
+                         "parent %s (pid %lu, create_time %llu) -- the parent "
+                         "could not have spawned it; likely PPID spoofing "
+                         "(PROC_THREAD_ATTRIBUTE_PARENT_PROCESS) or PID reuse",
+                         r->name, (unsigned long)r->pid,
+                         (unsigned long long)r->create_time,
+                         cp->name[0] ? cp->name : "?", (unsigned long)cp->pid,
+                         (unsigned long long)cp->create_time);
+            }
+        }
+    }
+
+    /* PROC.LOLBIN_ARGS -- a signed living-off-the-land binary invoked with
+     * arguments that fetch/run external or user-writable content (T1218). */
+    if (r->cmdline[0] && is_lolbin_name(r->name)) {
+        bool strong = false;
+        if (lolbin_arg_suspicious(r->cmdline, &strong)) {
+            bus_emit(c->bus, "PROC.LOLBIN_ARGS", SEV_HIGH,
+                     conf_clamp(strong ? 85 : 80), ACT_REVIEW, r->pid, target,
+                     "Living-off-the-land binary with suspicious arguments",
+                     "%s (pid %lu) invoked with: %.380s",
+                     r->name, (unsigned long)r->pid, r->cmdline);
+        }
+    }
+
+    /* PROC.ENCODED_CMD -- obfuscated/hidden PowerShell. When a -enc blob is
+     * present we decode it (UTF-16LE) and rescan, escalating if the cleartext
+     * reveals a download/execute or an IOC (T1059.001 / T1027). */
+    if (r->cmdline[0] &&
+        (is_powershell_name(r->name) || str_icontains(r->cmdline, "powershell"))) {
+        static const char *mk[] = {
+            " -enc", " -encodedcommand", " -e ", "frombase64string",
+            "downloadstring", "invoke-expression", "iex(", "iex ",
+            "-w hidden", "-windowstyle hidden", "-nop"
+        };
+        const char *matched = NULL;
+        for (size_t i = 0; i < sizeof(mk) / sizeof(mk[0]); i++)
+            if (str_icontains(r->cmdline, mk[i])) { matched = mk[i]; break; }
+        if (matched) {
+            Severity sev = SEV_HIGH;
+            int conf = 75;
+            char extra[256];
+            extra[0] = '\0';
+            char tok[8192];
+            if (extract_enc_token(r->cmdline, tok, sizeof tok)) {
+                unsigned char raw[8192];
+                size_t n = b64_decode(tok, raw, sizeof raw);
+                char dec[4096];
+                size_t dn = 0;
+                for (size_t i = 0; i + 1 < n && dn + 1 < sizeof dec; i += 2) {
+                    unsigned char lo = raw[i], hi = raw[i + 1];
+                    dec[dn++] = (hi == 0 && lo >= 32 && lo < 127) ? (char)lo : '.';
+                }
+                dec[dn] = '\0';
+                bool bad = str_icontains(dec, "downloadstring") ||
+                           str_icontains(dec, "iex") ||
+                           str_icontains(dec, "http://") ||
+                           str_icontains(dec, "https://") ||
+                           str_icontains(dec, "frombase64") ||
+                           str_icontains(dec, "\\temp\\") ||
+                           str_icontains(dec, "\\appdata\\");
+                if (!bad && c->ioc && ioc_match_string(c->ioc, dec))
+                    bad = true;
+                if (bad && dn > 0) {
+                    sev = SEV_CRIT;
+                    conf = 90;
+                    snprintf(extra, sizeof extra, "; decoded reveals: %.180s", dec);
+                }
+            }
+            bus_emit(c->bus, "PROC.ENCODED_CMD", sev, conf_clamp(conf),
+                     ACT_REVIEW, r->pid, target,
+                     "Obfuscated / hidden PowerShell command line",
+                     "%s (pid %lu) matched '%s'%s",
+                     r->name, (unsigned long)r->pid, matched, extra);
         }
     }
 }

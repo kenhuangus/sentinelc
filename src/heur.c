@@ -78,20 +78,6 @@ static bool ci_eq(const char *a, const char *b)
     return *a == '\0' && *b == '\0';
 }
 
-/* Does `s` begin with prefix `p` (case-insensitive)? */
-static bool ci_startswith(const char *s, const char *p)
-{
-    if (!s || !p)
-        return false;
-    while (*p) {
-        if (tolower((unsigned char)*s) != tolower((unsigned char)*p))
-            return false;
-        ++s;
-        ++p;
-    }
-    return true;
-}
-
 /* Get %SystemRoot% (e.g. "C:\\Windows"), no trailing slash. */
 static void get_windir(char *out, size_t cap)
 {
@@ -110,6 +96,213 @@ static void get_windir(char *out, size_t cap)
         out[len - 1] = '\0';
         --len;
     }
+}
+
+/* ===================================================================
+ *  Path canonicalization
+ *
+ *  Turn an arbitrary (possibly relative, 8.3-short, prefixed, or
+ *  trailing-dot/space) UTF-8 path into a single normalized, lowercased
+ *  UTF-8 form so that downstream comparisons can be done on path-segment
+ *  boundaries instead of raw substrings:
+ *    1. UTF-8 -> wide.
+ *    2. GetFullPathNameW   -> resolves "..", ".", relative paths, and
+ *       normalizes forward slashes to '\' and strips trailing dots/spaces.
+ *    3. GetLongPathNameW   -> expands 8.3 short names (DOCUME~1 -> ...).
+ *       This fails when the file does not exist; on any failure we keep
+ *       the GetFullPathNameW result.
+ *    4. Strip a leading "\\?\" or "\\?\UNC\" extended-length prefix.
+ *    5. Lowercase (invariant ASCII-ish; tolower on wide units).
+ *    6. wide -> UTF-8.
+ *  On ANY failure we fall back to copying the original string verbatim,
+ *  so we never crash or drop the path.
+ * =================================================================== */
+
+/* Buffers are sized generously: paths can exceed MAX_PATH once "\\?\" /
+ * long-name expansion is in play. */
+#define SC_CANON_WIDE (2 * SC_MAX_PATH)
+
+static void canonicalize_path(const char *in, char *out, size_t out_cap)
+{
+    if (!out || out_cap == 0)
+        return;
+    out[0] = '\0';
+    if (!in)
+        return;
+
+    /* Fallback copy helper (truncate-safe, NUL-terminated). */
+    /* We populate `out` with the original up-front; every early return
+     * below therefore yields a usable value. */
+    {
+        size_t i = 0;
+        for (; in[i] && i + 1 < out_cap; ++i)
+            out[i] = in[i];
+        out[i] = '\0';
+    }
+    if (in[0] == '\0')
+        return;
+
+    wchar_t win[SC_CANON_WIDE];
+    win[0] = L'\0';
+    if (utf8_to_wide(in, win, SC_CANON_WIDE) == 0)
+        return; /* keep original */
+    win[SC_CANON_WIDE - 1] = L'\0';
+
+    /* Step 2: GetFullPathNameW. */
+    wchar_t wfull[SC_CANON_WIDE];
+    wfull[0] = L'\0';
+    DWORD nf = GetFullPathNameW(win, SC_CANON_WIDE, wfull, NULL);
+    if (nf == 0 || nf >= SC_CANON_WIDE) {
+        /* Too long or failed: keep what we already have (original). */
+        return;
+    }
+    wfull[SC_CANON_WIDE - 1] = L'\0';
+
+    /* Step 3: GetLongPathNameW (expands 8.3). Fails if path doesn't exist
+     * -> fall back to the full-path result. */
+    wchar_t wlong[SC_CANON_WIDE];
+    wlong[0] = L'\0';
+    DWORD nl = GetLongPathNameW(wfull, wlong, SC_CANON_WIDE);
+    const wchar_t *chosen;
+    if (nl == 0 || nl >= SC_CANON_WIDE)
+        chosen = wfull;          /* nonexistent / too long -> full path */
+    else {
+        wlong[SC_CANON_WIDE - 1] = L'\0';
+        chosen = wlong;
+    }
+
+    /* Step 4: strip extended-length prefix "\\?\" and "\\?\UNC\".
+     * `wunc` is stack-local (thread-safe). */
+    wchar_t wunc[SC_CANON_WIDE];
+    if (chosen[0] == L'\\' && chosen[1] == L'\\' &&
+        chosen[2] == L'?'  && chosen[3] == L'\\') {
+        const wchar_t *p = chosen + 4;
+        /* "\\?\UNC\server\share" -> "\\server\share" */
+        if ((p[0] == L'U' || p[0] == L'u') &&
+            (p[1] == L'N' || p[1] == L'n') &&
+            (p[2] == L'C' || p[2] == L'c') &&
+            p[3] == L'\\') {
+            /* Re-form a normal UNC path: keep one leading backslash, the
+             * "UNC\" becomes "\". */
+            wunc[0] = L'\\';
+            size_t w = 1;
+            const wchar_t *q = p + 3; /* points at the '\' before server */
+            for (; *q && w + 1 < SC_CANON_WIDE; ++q)
+                wunc[w++] = *q;
+            wunc[w] = L'\0';
+            chosen = wunc;
+        } else {
+            chosen = p;
+        }
+    }
+
+    /* Step 5: lowercase into a writable buffer.
+     * NOTE: heur functions may run on a thread pool, so every working
+     * buffer here is on the stack -- no shared static state. */
+    wchar_t wlow[SC_CANON_WIDE];
+    {
+        size_t w = 0;
+        for (; chosen[w] && w + 1 < SC_CANON_WIDE; ++w) {
+            wchar_t c = chosen[w];
+            if (c >= L'A' && c <= L'Z')
+                c = (wchar_t)(c - L'A' + L'a');
+            wlow[w] = c;
+        }
+        wlow[w] = L'\0';
+    }
+
+    /* Step 6: wide -> UTF-8 back into out. On failure keep original. */
+    char tmp[SC_CANON_WIDE];
+    size_t got = wide_to_utf8(wlow, tmp, sizeof(tmp));
+    if (got == 0)
+        return; /* keep original copy already in out */
+    tmp[sizeof(tmp) - 1] = '\0';
+
+    size_t i = 0;
+    for (; tmp[i] && i + 1 < out_cap; ++i)
+        out[i] = tmp[i];
+    out[i] = '\0';
+}
+
+/* Lowercase a UTF-8 (ASCII path) string in place. Used to canonicalize
+ * the env-expanded anchors so both sides of the prefix test are lower. */
+static void ascii_lower(char *s)
+{
+    if (!s)
+        return;
+    for (; *s; ++s) {
+        if (*s >= 'A' && *s <= 'Z')
+            *s = (char)(*s - 'A' + 'a');
+    }
+}
+
+/* Segment-boundary prefix test: returns true iff `path` starts with
+ * `prefix` AND the boundary in `path` immediately after the prefix is a
+ * path separator or end-of-string. Both inputs are assumed lowercased.
+ * Trailing separators on `prefix` are ignored so "C:\\windows\\" and
+ * "C:\\windows" behave identically.
+ *
+ *   prefix="c:\\windows\\system32"
+ *     "c:\\windows\\system32"        -> true  (exact, EOS boundary)
+ *     "c:\\windows\\system32\\a.dll" -> true  ('\\' boundary)
+ *     "c:\\windows\\system32evil"    -> false (no boundary)
+ *     "c:\\x\\windows\\system32"     -> false (not a prefix)
+ */
+static bool seg_prefix(const char *path, const char *prefix)
+{
+    if (!path || !prefix)
+        return false;
+    size_t lp = strlen(prefix);
+    /* Ignore trailing separators on the prefix. */
+    while (lp > 0 && (prefix[lp - 1] == '\\' || prefix[lp - 1] == '/'))
+        --lp;
+    if (lp == 0)
+        return false;
+    if (strncmp(path, prefix, lp) != 0)
+        return false;
+    char nxt = path[lp];
+    return nxt == '\0' || nxt == '\\' || nxt == '/';
+}
+
+/* Does any path SEGMENT of `path` exactly equal `seg` (e.g. "$recycle.bin",
+ * "temp")?  Matches a directory/file component bounded by separators or the
+ * string ends. `path` and `seg` are lowercased. */
+static bool has_segment(const char *path, const char *seg)
+{
+    if (!path || !seg || seg[0] == '\0')
+        return false;
+    size_t ls = strlen(seg);
+    const char *p = path;
+    while (*p) {
+        /* p sits at the start of a segment. */
+        if (strncmp(p, seg, ls) == 0) {
+            char nxt = p[ls];
+            if (nxt == '\0' || nxt == '\\' || nxt == '/')
+                return true;
+        }
+        /* advance to the char after the next separator */
+        while (*p && *p != '\\' && *p != '/')
+            ++p;
+        while (*p == '\\' || *p == '/')
+            ++p;
+    }
+    return false;
+}
+
+/* Expand+lowercase an environment variable's value into `out`. Returns
+ * true if the variable was present and non-empty. */
+static bool get_env_lower(const char *name, char *out, size_t cap)
+{
+    if (!out || cap == 0)
+        return false;
+    out[0] = '\0';
+    DWORD r = GetEnvironmentVariableA(name, out, (DWORD)cap);
+    if (r == 0 || r >= cap) {
+        out[0] = '\0';
+        return false;
+    }
+    ascii_lower(out);
+    return out[0] != '\0';
 }
 
 /* Local base-name extraction (avoids cross-module dependency). */
@@ -139,52 +332,57 @@ PathLoc path_classify(const char *path)
     if (!path || path[0] == '\0')
         return PATHLOC_OTHER;
 
+    /* Canonicalize once; everything below compares on the normalized,
+     * lowercased form using segment-boundary matching. */
+    char c[SC_CANON_WIDE];
+    canonicalize_path(path, c, sizeof(c));
+    if (c[0] == '\0')
+        return PATHLOC_OTHER;
+
+    /* Windows dir (lowercased), and its well-known subdirs. */
     char windir[MAX_PATH];
     get_windir(windir, sizeof(windir));
+    ascii_lower(windir);
 
-    /* Build the well-known system subdirs from windir. */
     char sys32[MAX_PATH + 32], syswow[MAX_PATH + 32], winsxs[MAX_PATH + 32];
-    snprintf(sys32,  sizeof(sys32),  "%s\\System32", windir);
-    snprintf(syswow, sizeof(syswow), "%s\\SysWOW64", windir);
-    snprintf(winsxs, sizeof(winsxs), "%s\\WinSxS", windir);
+    snprintf(sys32,  sizeof(sys32),  "%s\\system32", windir);
+    snprintf(syswow, sizeof(syswow), "%s\\syswow64", windir);
+    snprintf(winsxs, sizeof(winsxs), "%s\\winsxs",   windir);
 
-    /* TEMP / RECYCLE checks are substring-based and take priority for the
-     * "user-writable" intent regardless of root. */
-    if (ci_contains(path, "$Recycle.Bin"))
+    /* TEMP / RECYCLE take priority for the "user-writable" intent,
+     * regardless of root. Match real path segments, not substrings. */
+    if (has_segment(c, "$recycle.bin"))
         return PATHLOC_RECYCLE;
-    if (ci_contains(path, "\\AppData\\Local\\Temp") ||
-        ci_contains(path, "\\Temp\\"))
+    if (has_segment(c, "temp"))
         return PATHLOC_TEMP;
 
-    /* SYSTEM dirs. */
-    if (ci_startswith(path, sys32) || ci_startswith(path, syswow) ||
-        ci_startswith(path, winsxs))
+    /* SYSTEM dirs (System32 / SysWOW64 / WinSxS). */
+    if (seg_prefix(c, sys32) || seg_prefix(c, syswow) || seg_prefix(c, winsxs))
         return PATHLOC_SYSTEM;
 
-    /* Program Files (check (x86) first since it shares the prefix). */
+    /* Program Files (env-anchored; check both 64- and 32-bit roots). */
     {
-        char pf[MAX_PATH] = {0}, pfx86[MAX_PATH] = {0};
-        DWORD r1 = GetEnvironmentVariableA("ProgramFiles", pf, sizeof(pf));
-        DWORD r2 = GetEnvironmentVariableA("ProgramFiles(x86)", pfx86, sizeof(pfx86));
-        if (r1 > 0 && r1 < sizeof(pf) && ci_startswith(path, pf))
+        char pf[MAX_PATH], pfx86[MAX_PATH];
+        if (get_env_lower("ProgramFiles", pf, sizeof(pf)) && seg_prefix(c, pf))
             return PATHLOC_PROGRAMFILES;
-        if (r2 > 0 && r2 < sizeof(pfx86) && ci_startswith(path, pfx86))
+        if (get_env_lower("ProgramFiles(x86)", pfx86, sizeof(pfx86)) &&
+            seg_prefix(c, pfx86))
             return PATHLOC_PROGRAMFILES;
-        /* Generic fallback by name. */
-        if (ci_contains(path, "\\Program Files (x86)\\") ||
-            ci_contains(path, "\\Program Files\\"))
-            return PATHLOC_PROGRAMFILES;
+        /* No "by name anywhere" fallback: that was the evasion primitive.
+         * A "Program Files" directory under a user-writable root must NOT
+         * be treated as the protected Program Files. */
     }
 
     /* Anything else under %SystemRoot% is WINDOWS. */
-    if (ci_startswith(path, windir))
+    if (seg_prefix(c, windir))
         return PATHLOC_WINDOWS;
 
-    /* User-writable locations. */
-    if (ci_contains(path, "\\Users\\") ||
-        ci_contains(path, "\\AppData\\") ||
-        ci_contains(path, "\\ProgramData\\") ||
-        ci_contains(path, "\\Public\\"))
+    /* User-writable locations: any path containing one of these as a real
+     * segment. \Temp already handled above (returns TEMP). */
+    if (has_segment(c, "users") ||
+        has_segment(c, "appdata") ||
+        has_segment(c, "programdata") ||
+        has_segment(c, "public"))
         return PATHLOC_USER_WRITABLE;
 
     return PATHLOC_OTHER;
@@ -314,25 +512,34 @@ bool name_is_masquerade(const char *image_path)
     if (!image_path || image_path[0] == '\0')
         return false;
 
+    /* Canonicalize first so short names ("PROGRA~1"), forward slashes,
+     * "\\?\" prefixes, and trailing dots/spaces are normalized away before
+     * we compare the directory against the legit homes. */
+    char canon[SC_CANON_WIDE];
+    canonicalize_path(image_path, canon, sizeof(canon));
+    if (canon[0] == '\0')
+        return false;
+
     char name[SC_NAME_LEN];
-    local_base_name(image_path, name, sizeof(name));
+    local_base_name(canon, name, sizeof(name));
     if (name[0] == '\0')
         return false;
 
     char windir[MAX_PATH];
     get_windir(windir, sizeof(windir));
+    ascii_lower(windir);
 
     char sys32[MAX_PATH + 32], syswow[MAX_PATH + 32];
-    snprintf(sys32,  sizeof(sys32),  "%s\\System32", windir);
-    snprintf(syswow, sizeof(syswow), "%s\\SysWOW64", windir);
+    snprintf(sys32,  sizeof(sys32),  "%s\\system32", windir);
+    snprintf(syswow, sizeof(syswow), "%s\\syswow64", windir);
 
-    /* Build the directory portion of the image path. */
-    char dir[SC_MAX_PATH];
+    /* Directory portion of the canonical path (lowercased already). */
+    char dir[SC_CANON_WIDE];
     {
-        size_t len = strlen(image_path);
+        size_t len = strlen(canon);
         size_t cut = (size_t)-1;
         for (size_t i = len; i > 0; --i) {
-            if (image_path[i - 1] == '\\' || image_path[i - 1] == '/') {
+            if (canon[i - 1] == '\\' || canon[i - 1] == '/') {
                 cut = i - 1;
                 break;
             }
@@ -341,7 +548,7 @@ bool name_is_masquerade(const char *image_path)
             dir[0] = '\0'; /* bare name, no directory */
         } else {
             size_t n = cut < sizeof(dir) - 1 ? cut : sizeof(dir) - 1;
-            memcpy(dir, image_path, n);
+            memcpy(dir, canon, n);
             dir[n] = '\0';
         }
     }
@@ -350,12 +557,16 @@ bool name_is_masquerade(const char *image_path)
         const struct sys_image *si = &kSysImages[i];
 
         if (ci_eq(name, si->name)) {
-            /* Exact critical-name match: verify it lives in its legit dir. */
+            /* Exact critical-name match: verify it lives in its legit dir.
+             * Use seg_prefix so an exact dir match (or a trailing
+             * separator) is accepted; both sides are lowercase. */
             if (si->loc == 0) {
-                /* System32 or SysWOW64 are both acceptable legit homes. */
+                /* System32 or SysWOW64 are both acceptable legit homes.
+                 * The binary must sit *directly* in that dir, so compare
+                 * the (canonical, lowercased) directory for equality. */
                 if (ci_eq(dir, sys32) || ci_eq(dir, syswow))
-                    return false; /* legit */
-                return true;      /* right name, wrong place */
+                    return false;     /* legit */
+                return true;          /* right name, wrong place */
             } else {
                 /* explorer.exe legit dir is %SystemRoot% root. */
                 if (ci_eq(dir, windir))

@@ -12,6 +12,127 @@
 #include <string.h>
 #include <ctype.h>
 
+/* ---- result cache (OPT 1) -------------------------------------------------
+ * pe_analyze() is called ~10x redundantly per scan (once per process in
+ * scan_process, again per process in scan_keylog) over a small set of unique
+ * images. Memoize the (PeInfo, result) by (lowercased path, last-write-time,
+ * file size) so a repeat call on an unchanged file skips the whole map+entropy
+ * pass. The key is obtained cheaply via GetFileAttributesExW -- we never open
+ * or map the file just to compute it.
+ *
+ * Thread-safety: pe_analyze runs on the main thread (scan_process) and the
+ * thread pool (scan_keylog) concurrently. A single CRITICAL_SECTION, lazily
+ * created exactly once via InitOnceExecuteOnce (mirrors sign.c), guards the
+ * table. The lock is held ONLY around the lookup and the insert -- never during
+ * the file mapping / entropy work -- so concurrent misses on different files
+ * still run in parallel. PeInfo is copied out by value under the lock, so we
+ * never hand back a pointer into the (fixed, non-realloc) array.
+ */
+#define PE_CACHE_CAP 4096
+
+typedef struct {
+    char    path[SC_MAX_PATH];   /* lowercased UTF-8 path */
+    uint64_t mtime;              /* LastWriteTime FILETIME as u64 */
+    uint64_t fsize;              /* file size in bytes */
+    PeInfo  info;
+    bool    result;             /* pe_analyze() return value */
+    bool    used;
+} PeCacheEntry;
+
+static PeCacheEntry    *g_pe_cache = NULL;     /* fixed array, never realloc'd */
+static size_t           g_pe_cache_count = 0;
+static CRITICAL_SECTION g_pe_cache_lock;
+static INIT_ONCE        g_pe_cache_once = INIT_ONCE_STATIC_INIT;
+static bool             g_pe_cache_ready = false;
+
+static BOOL CALLBACK pe_cache_init_once(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&g_pe_cache_lock);
+    /* One up-front allocation: a fixed array so entries never move (pointers
+     * into it would otherwise dangle across a realloc). If it fails, caching is
+     * simply disabled -- analysis still runs, just without memoization. */
+    g_pe_cache       = (PeCacheEntry *)calloc(PE_CACHE_CAP, sizeof(PeCacheEntry));
+    g_pe_cache_count = 0;
+    g_pe_cache_ready = (g_pe_cache != NULL);
+    return TRUE;
+}
+
+/* Build the cache key for `path` without opening the file. Returns false if the
+ * attributes can't be read (caller then proceeds without caching). On success,
+ * `lower_out` (cap SC_MAX_PATH) gets the lowercased path, and *mtime / *fsize
+ * are filled. */
+static bool pe_cache_key(const char *path, char *lower_out,
+                         uint64_t *mtime, uint64_t *fsize)
+{
+    wchar_t wpath[SC_MAX_PATH * 2];
+    if (utf8_to_wide(path, wpath, sizeof wpath / sizeof wpath[0]) == 0)
+        return false;
+
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExW(wpath, GetFileExInfoStandard, &fad))
+        return false;
+    if (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        return false;
+
+    /* Lowercased copy of the path (bounded to SC_MAX_PATH). */
+    size_t n = strlen(path);
+    if (n >= SC_MAX_PATH) n = SC_MAX_PATH - 1;
+    memcpy(lower_out, path, n);
+    lower_out[n] = '\0';
+    str_lower(lower_out);
+
+    *mtime = ((uint64_t)fad.ftLastWriteTime.dwHighDateTime << 32) |
+             (uint64_t)fad.ftLastWriteTime.dwLowDateTime;
+    *fsize = ((uint64_t)fad.nFileSizeHigh << 32) | (uint64_t)fad.nFileSizeLow;
+    return true;
+}
+
+/* Lookup under the lock. On hit, copies PeInfo by value into *out and the
+ * cached return value into *result, then returns true. */
+static bool pe_cache_get(const char *lpath, uint64_t mtime, uint64_t fsize,
+                         PeInfo *out, bool *result)
+{
+    bool hit = false;
+    if (!g_pe_cache_ready) return false;
+    EnterCriticalSection(&g_pe_cache_lock);
+    for (size_t i = 0; i < g_pe_cache_count; i++) {
+        if (g_pe_cache[i].used &&
+            g_pe_cache[i].mtime == mtime &&
+            g_pe_cache[i].fsize == fsize &&
+            strcmp(g_pe_cache[i].path, lpath) == 0) {
+            *out    = g_pe_cache[i].info;     /* copy out by value */
+            *result = g_pe_cache[i].result;
+            hit = true;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_pe_cache_lock);
+    return hit;
+}
+
+/* Insert under the lock. Caps at PE_CACHE_CAP entries; once full, new entries
+ * are silently dropped (no eviction, no realloc thrash). */
+static void pe_cache_put(const char *lpath, uint64_t mtime, uint64_t fsize,
+                         const PeInfo *info, bool result)
+{
+    if (!g_pe_cache_ready) return;
+    EnterCriticalSection(&g_pe_cache_lock);
+    if (g_pe_cache_count < PE_CACHE_CAP) {
+        PeCacheEntry *e = &g_pe_cache[g_pe_cache_count];
+        /* lpath is already bounded to < SC_MAX_PATH by pe_cache_key. */
+        strncpy(e->path, lpath, sizeof e->path - 1);
+        e->path[sizeof e->path - 1] = '\0';
+        e->mtime  = mtime;
+        e->fsize  = fsize;
+        e->info   = *info;
+        e->result = result;
+        e->used   = true;
+        g_pe_cache_count++;
+    }
+    LeaveCriticalSection(&g_pe_cache_lock);
+}
+
 /* ---- local bounds helpers -------------------------------------------------
  * All take the mapped base + size and a candidate (offset, length). Return
  * true only when [off, off+len) lies fully inside [0, size).
@@ -268,6 +389,20 @@ bool pe_analyze(const char *path, PeInfo *out)
     const unsigned char *base = NULL;
     LARGE_INTEGER li = {0};
 
+    /* ---- OPT 1: result cache lookup ---- */
+    InitOnceExecuteOnce(&g_pe_cache_once, pe_cache_init_once, NULL, NULL);
+    char     ckey[SC_MAX_PATH];
+    uint64_t cmtime = 0, csize = 0;
+    bool     have_key = pe_cache_key(path, ckey, &cmtime, &csize);
+    if (have_key) {
+        PeInfo cached;
+        bool   cached_result;
+        if (pe_cache_get(ckey, cmtime, csize, &cached, &cached_result)) {
+            *out = cached;            /* copy by value, no dangling pointer */
+            return cached_result;
+        }
+    }
+
     wchar_t wpath[SC_MAX_PATH * 2];
     if (utf8_to_wide(path, wpath, sizeof wpath / sizeof wpath[0]) == 0)
         return false;
@@ -301,8 +436,12 @@ bool pe_analyze(const char *path, PeInfo *out)
         return false;
     }
 
-    /* Whole-file entropy is meaningful even for non-PE files. */
-    out->overall_entropy = shannon_entropy(base, size);
+    /* OPT 2: do NOT scan the whole file for entropy here. For a valid PE,
+     * overall_entropy is unused by any rule (looks_packed derives from the
+     * per-section entropy + import/packer heuristics computed below), so the
+     * whole-file pass is pure waste. For NON-PE inputs scan_path.c still reads
+     * overall_entropy (FILE.HIGH_ENTROPY: !is_pe && overall_entropy > 7.2), so
+     * we compute it lazily at the `not_pe` exit -- only when is_pe is false. */
 
     /* ---- DOS header ---- */
     if (!range_ok(size, 0, sizeof(IMAGE_DOS_HEADER)))
@@ -398,6 +537,9 @@ bool pe_analyze(const char *path, PeInfo *out)
         if (e > max_ent) max_ent = e;
     }
     out->max_section_entropy = max_ent;
+    /* OPT 2: for a PE, overall_entropy is section-derived (no rule reads it for
+     * PE images). Use the highest section entropy as a cheap stand-in. */
+    out->overall_entropy = max_ent;
 
     /* ---- Imports ---- */
     if (have_import_dir)
@@ -417,8 +559,20 @@ sections_unknown:
         out->looks_packed = (out->packer_hint[0] != '\0');
 
 done:
+    /* OPT 2: non-PE inputs still need a whole-file overall_entropy, since
+     * scan_path.c's FILE.HIGH_ENTROPY rule reads it for !is_pe files. We skip
+     * this scan only for valid PEs (where overall_entropy was set from section
+     * data above and no rule consults it). */
+    if (!out->is_pe && base)
+        out->overall_entropy = shannon_entropy(base, size);
+
     if (base) UnmapViewOfFile(base);
     if (hMap) CloseHandle(hMap);
     if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+
+    /* ---- OPT 1: store the result before returning. ---- */
+    if (have_key)
+        pe_cache_put(ckey, cmtime, csize, out, result);
+
     return result;
 }

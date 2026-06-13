@@ -34,10 +34,15 @@ case "$GCC" in
 esac
 
 mkdir -p build
+# Exploit-mitigation flags: stack canaries + FORTIFY + format checks (compile),
+# ASLR / DEP / high-entropy ASLR (link). gcc auto-links the stack-protector
+# runtime, so no explicit -lssp (which is absent on some MinGW builds).
+HARDEN_C="-fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wformat -Wformat-security -fno-strict-aliasing"
+HARDEN_L="-Wl,--dynamicbase,--nxcompat,--high-entropy-va"
 LIBS="-lwintrust -lcrypt32 -lbcrypt -liphlpapi -lws2_32 -lpsapi -lwtsapi32 \
       -lole32 -loleaut32 -luuid -lshell32 -ladvapi32 -lkernel32 -lm"
 echo "Compiling $(ls src/*.c | wc -l) modules..."
 # shellcheck disable=SC2086
-"$GCC" -std=c11 -Wall -Wextra -O2 -I include $(ls src/*.c) \
-       -o build/sentinelc.exe $LIBS
+"$GCC" -std=c11 -Wall -Wextra -O2 $HARDEN_C -I include $(ls src/*.c) \
+       -o build/sentinelc.exe $HARDEN_L $LIBS
 echo "OK -> build/sentinelc.exe"
