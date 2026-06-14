@@ -61,10 +61,23 @@ function sanitizeHostname(name) {
   return trimmed;
 }
 
-function extractFindings(scan) {
-  if (!scan) return [];
-  if (Array.isArray(scan)) return scan;
-  if (Array.isArray(scan.findings)) return scan.findings;
+// Accept several ingest envelopes so a host's findings are never silently
+// dropped on a plausible-but-different payload shape:
+//   { hostname, scan: { findings: [...] } }   <- production agent (submit.ps1)
+//   { hostname, scan: [ ... ] }                <- scanner emitted a bare array
+//   { hostname, findings: [ ... ] }            <- findings at the top level
+//   [ ... ]                                    <- bare array body
+// A security console must surface what an endpoint reported, not 200-OK it
+// into the void because the wrapper key was missing.
+function extractFindings(payload) {
+  if (!payload) return [];
+  if (Array.isArray(payload)) return payload;
+  const scan = payload.scan;
+  if (scan) {
+    if (Array.isArray(scan)) return scan;
+    if (Array.isArray(scan.findings)) return scan.findings;
+  }
+  if (Array.isArray(payload.findings)) return payload.findings;
   return [];
 }
 
@@ -196,7 +209,7 @@ async function handleIngest(req, res) {
     return sendJson(res, 400, { ok: false, error: 'invalid hostname' });
   }
 
-  const findings = extractFindings(payload.scan);
+  const findings = extractFindings(payload);
   const counts = countSeverities(findings);
   const tr = topRules(findings, 5);
   const scannedAt = (typeof payload.scannedAt === 'string' && payload.scannedAt) || new Date().toISOString();
