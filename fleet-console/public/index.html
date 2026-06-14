@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SentinelC Fleet Console</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel2: #1c2230;
+    --border: #2b313b;
+    --fg: #e6edf3;
+    --muted: #8b949e;
+    --crit: #f85149;
+    --high: #fb8500;
+    --med: #d29922;
+    --low: #58a6ff;
+    --info: #6e7681;
+    --accent: #2f81f7;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+  }
+  header {
+    padding: 18px 24px;
+    border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, #11161d, #0d1117);
+    display: flex;
+    align-items: baseline;
+    gap: 18px;
+    flex-wrap: wrap;
+  }
+  header h1 { margin: 0; font-size: 18px; letter-spacing: .3px; }
+  header .brand-sub { color: var(--muted); font-size: 12px; }
+  .summary { margin-left: auto; display: flex; gap: 22px; }
+  .stat { text-align: right; }
+  .stat .num { font-size: 22px; font-weight: 600; }
+  .stat .lbl { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+  .stat.alert .num { color: var(--crit); }
+
+  main { display: flex; gap: 0; height: calc(100vh - 70px); }
+  .fleet { flex: 1 1 60%; overflow: auto; padding: 16px 24px; }
+  .detail {
+    flex: 1 1 40%;
+    max-width: 560px;
+    border-left: 1px solid var(--border);
+    background: var(--panel);
+    overflow: auto;
+    padding: 16px 20px;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); }
+  th {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
+    color: var(--muted); cursor: pointer; user-select: none; position: sticky; top: 0;
+    background: var(--bg);
+  }
+  th:hover { color: var(--fg); }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: var(--panel2); }
+  tbody tr.selected { background: #1f6feb22; outline: 1px solid var(--accent); }
+  .host { font-weight: 600; }
+  .seen { color: var(--muted); font-size: 12px; }
+
+  .badge {
+    display: inline-block; min-width: 26px; text-align: center;
+    padding: 2px 7px; border-radius: 5px; font-size: 12px; font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .badge.zero { opacity: .28; background: #21262d; color: var(--muted); }
+  .b-crit { background: #f8514922; color: var(--crit); border: 1px solid #f8514955; }
+  .b-high { background: #fb850022; color: var(--high); border: 1px solid #fb850055; }
+  .b-med  { background: #d2992222; color: var(--med);  border: 1px solid #d2992255; }
+  .b-low  { background: #58a6ff22; color: var(--low);  border: 1px solid #58a6ff55; }
+  .total { font-weight: 700; font-variant-numeric: tabular-nums; }
+
+  .detail h2 { margin: 0 0 2px; font-size: 16px; }
+  .detail .meta { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+  .detail .empty { color: var(--muted); margin-top: 40px; text-align: center; }
+  .finding {
+    border: 1px solid var(--border); border-left-width: 3px;
+    border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; background: var(--panel2);
+  }
+  .finding.sev-critical { border-left-color: var(--crit); }
+  .finding.sev-high { border-left-color: var(--high); }
+  .finding.sev-medium { border-left-color: var(--med); }
+  .finding.sev-low { border-left-color: var(--low); }
+  .finding.sev-info { border-left-color: var(--info); }
+  .finding .row1 { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .finding .rule { font-weight: 600; }
+  .finding .sevtag {
+    font-size: 10px; padding: 1px 6px; border-radius: 4px; text-transform: uppercase;
+    letter-spacing: .5px; font-weight: 700;
+  }
+  .sevtag.sev-critical { background: var(--crit); color: #fff; }
+  .sevtag.sev-high { background: var(--high); color: #1a1a1a; }
+  .sevtag.sev-medium { background: var(--med); color: #1a1a1a; }
+  .sevtag.sev-low { background: var(--low); color: #06121f; }
+  .sevtag.sev-info { background: var(--info); color: #fff; }
+  .finding .title { color: var(--fg); margin-bottom: 4px; }
+  .finding .target { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+  .finding .evidence {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 12px; background: #0b0f15; border: 1px solid var(--border);
+    border-radius: 4px; padding: 7px 9px; white-space: pre-wrap; word-break: break-word;
+    color: #c9d1d9; max-height: 160px; overflow: auto;
+  }
+  .refresh { color: var(--muted); font-size: 11px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>SentinelC &middot; Fleet Console</h1>
+    <div class="brand-sub">Windows threat-triage &mdash; fleet management view</div>
+  </div>
+  <div class="summary">
+    <div class="stat"><div class="num" id="s-hosts">0</div><div class="lbl">Hosts</div></div>
+    <div class="stat alert"><div class="num" id="s-crithosts">0</div><div class="lbl">With criticals</div></div>
+    <div class="stat"><div class="num" id="s-crit">0</div><div class="lbl">Total criticals</div></div>
+  </div>
+</header>
+
+<main>
+  <section class="fleet">
+    <table id="fleet-table">
+      <thead>
+        <tr>
+          <th data-sort="hostname">Host</th>
+          <th data-sort="lastSeen">Last seen</th>
+          <th data-sort="critical">CRIT</th>
+          <th data-sort="high">HIGH</th>
+          <th data-sort="medium">MED</th>
+          <th data-sort="low">LOW</th>
+          <th data-sort="total">Total</th>
+        </tr>
+      </thead>
+      <tbody id="fleet-body"></tbody>
+    </table>
+    <div class="refresh" id="refresh-note"></div>
+  </section>
+
+  <aside class="detail" id="detail">
+    <div class="empty">Select a host to view its findings.</div>
+  </aside>
+</main>
+
+<script>
+  var hosts = [];
+  var selected = null;
+  var sortKey = 'critical';
+  var sortDir = -1;
+
+  function fmtTime(iso) {
+    if (!iso) return '—';
+    var d = new Date(iso);
+    if (isNaN(d)) return iso;
+    return d.toLocaleString();
+  }
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+  function badge(n, cls) {
+    var zero = (n || 0) === 0;
+    return '<span class="badge ' + (zero ? 'zero' : cls) + '">' + (n || 0) + '</span>';
+  }
+
+  function sortHosts() {
+    hosts.sort(function (a, b) {
+      var av, bv;
+      if (sortKey === 'hostname') { av = a.hostname.toLowerCase(); bv = b.hostname.toLowerCase(); }
+      else if (sortKey === 'lastSeen') { av = a.lastSeen || ''; bv = b.lastSeen || ''; }
+      else if (sortKey === 'total') { av = a.counts.total; bv = b.counts.total; }
+      else { av = a.counts[sortKey]; bv = b.counts[sortKey]; }
+      if (av < bv) return -1 * sortDir;
+      if (av > bv) return 1 * sortDir;
+      // tiebreak: critical then high
+      return (b.counts.critical - a.counts.critical) || (b.counts.high - a.counts.high);
+    });
+  }
+
+  function renderFleet() {
+    sortHosts();
+    var body = document.getElementById('fleet-body');
+    if (!hosts.length) {
+      body.innerHTML = '<tr><td colspan="7" style="color:var(--muted);padding:24px">No hosts have reported yet. Run submit.ps1 on an endpoint.</td></tr>';
+    } else {
+      body.innerHTML = hosts.map(function (h) {
+        var c = h.counts;
+        return '<tr data-host="' + esc(h.hostname) + '"' + (selected === h.hostname ? ' class="selected"' : '') + '>' +
+          '<td class="host">' + esc(h.hostname) + '</td>' +
+          '<td class="seen">' + esc(fmtTime(h.lastSeen)) + '</td>' +
+          '<td>' + badge(c.critical, 'b-crit') + '</td>' +
+          '<td>' + badge(c.high, 'b-high') + '</td>' +
+          '<td>' + badge(c.medium, 'b-med') + '</td>' +
+          '<td>' + badge(c.low, 'b-low') + '</td>' +
+          '<td class="total">' + (c.total || 0) + '</td>' +
+          '</tr>';
+      }).join('');
+      Array.prototype.forEach.call(body.querySelectorAll('tr'), function (tr) {
+        tr.addEventListener('click', function () { showHost(tr.getAttribute('data-host')); });
+      });
+    }
+    // summary
+    var crit = 0, critHosts = 0;
+    hosts.forEach(function (h) { crit += h.counts.critical; if (h.counts.critical > 0) critHosts++; });
+    document.getElementById('s-hosts').textContent = hosts.length;
+    document.getElementById('s-crithosts').textContent = critHosts;
+    document.getElementById('s-crit').textContent = crit;
+  }
+
+  function showHost(name) {
+    selected = name;
+    renderFleet();
+    var el = document.getElementById('detail');
+    el.innerHTML = '<div class="empty">Loading…</div>';
+    fetch('/api/host/' + encodeURIComponent(name)).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function (d) {
+      var findings = d.findings || [];
+      var order = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+      findings = findings.slice().sort(function (a, b) {
+        return (order[(a.severity || '').toLowerCase()] ?? 9) - (order[(b.severity || '').toLowerCase()] ?? 9);
+      });
+      var html = '<h2>' + esc(d.hostname) + '</h2>' +
+        '<div class="meta">Last seen ' + esc(fmtTime(d.lastSeen)) + ' · ' + findings.length + ' findings</div>';
+      if (!findings.length) {
+        html += '<div class="empty">No findings reported — clean.</div>';
+      } else {
+        html += findings.map(function (f) {
+          var sev = (f.severity || 'info').toLowerCase();
+          return '<div class="finding sev-' + esc(sev) + '">' +
+            '<div class="row1">' +
+              '<span class="sevtag sev-' + esc(sev) + '">' + esc(sev) + '</span>' +
+              '<span class="rule">' + esc(f.rule || '(unknown)') + '</span>' +
+            '</div>' +
+            (f.title ? '<div class="title">' + esc(f.title) + '</div>' : '') +
+            (f.target ? '<div class="target">target: ' + esc(f.target) + (f.pid != null ? ' · pid ' + esc(f.pid) : '') + '</div>' : '') +
+            (f.evidence ? '<div class="evidence">' + esc(f.evidence) + '</div>' : '') +
+            '</div>';
+        }).join('');
+      }
+      el.innerHTML = html;
+    }).catch(function (e) {
+      el.innerHTML = '<div class="empty">Failed to load: ' + esc(e.message) + '</div>';
+    });
+  }
+
+  function load() {
+    fetch('/api/hosts').then(function (r) { return r.json(); }).then(function (d) {
+      hosts = d || [];
+      renderFleet();
+      document.getElementById('refresh-note').textContent = 'Updated ' + new Date().toLocaleTimeString() + ' · auto-refresh 15s';
+    }).catch(function (e) {
+      document.getElementById('refresh-note').textContent = 'Error: ' + e.message;
+    });
+  }
+
+  // header sorting
+  Array.prototype.forEach.call(document.querySelectorAll('th[data-sort]'), function (th) {
+    th.addEventListener('click', function () {
+      var k = th.getAttribute('data-sort');
+      if (sortKey === k) { sortDir = -sortDir; } else { sortKey = k; sortDir = (k === 'hostname' || k === 'lastSeen') ? 1 : -1; }
+      renderFleet();
+    });
+  });
+
+  load();
+  setInterval(load, 15000);
+</script>
+</body>
+</html>

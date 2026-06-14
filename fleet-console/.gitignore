@@ -1,0 +1,3 @@
+# Runtime state and the shared bearer token must never be committed.
+data/
+config.json
