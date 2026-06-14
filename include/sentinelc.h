@@ -159,6 +159,7 @@ void scan_keylog(ScanCtx *c);    /* scan_keylog.c */
 void scan_path(ScanCtx *c);      /* pe.c/heur -- targeted file/dir scan */
 void scan_integrity(ScanCtx *c); /* scan_integrity.c -- Merkle FIM baseline/check */
 void scan_creds(ScanCtx *c);     /* scan_creds.c -- credential-access detection */
+void scan_memscan(ScanCtx *c);   /* scan_memscan.c -- in-memory injected-code scan */
 
 /* correlation pass: promotes multi-signal artifacts. engine.c */
 void correlate(ScanCtx *c);

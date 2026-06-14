@@ -468,6 +468,7 @@ int main(int argc, char **argv)
             fns[n] = scan_keylog;  names[n] = "keylogger"; n++;
             fns[n] = scan_rootkit; names[n] = "rootkit";   n++;
             fns[n] = scan_creds;   names[n] = "cred-access"; n++;
+            fns[n] = scan_memscan; names[n] = "memory";    n++;
         }
         run_scanners_parallel(&ctx, fns, names, n);
     }
