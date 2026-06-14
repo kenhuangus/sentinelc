@@ -112,6 +112,31 @@
     color: #c9d1d9; max-height: 160px; overflow: auto;
   }
   .refresh { color: var(--muted); font-size: 11px; margin-top: 10px; }
+
+  /* drill-down */
+  .finding .row1 { cursor: pointer; }
+  .finding .chev {
+    margin-left: auto; color: var(--muted); font-size: 11px;
+    transition: transform .15s ease; user-select: none;
+  }
+  .finding.open .chev { transform: rotate(90deg); }
+  .fdetail { display: none; margin-top: 8px; border-top: 1px dashed var(--border); padding-top: 8px; }
+  .finding.open .fdetail { display: block; }
+  .fgrid { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 12px; margin-bottom: 8px; }
+  .fgrid dt { color: var(--muted); white-space: nowrap; }
+  .fgrid dd { margin: 0; word-break: break-word; }
+  .confbar { display: inline-block; vertical-align: middle; width: 90px; height: 7px;
+    background: #0b0f15; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; margin-right: 7px; }
+  .confbar > i { display: block; height: 100%; background: var(--accent); }
+  .pill {
+    display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 4px;
+    background: #21262d; border: 1px solid var(--border); color: var(--fg);
+  }
+  .pill.act-kill, .pill.act-quarantine { background: #f8514922; color: var(--crit); border-color: #f8514955; }
+  .pill.act-suspend, .pill.act-disable_svc { background: #fb850022; color: var(--high); border-color: #fb850055; }
+  .pill.act-review { background: #58a6ff22; color: var(--low); border-color: #58a6ff55; }
+  .fexplain { font-size: 12px; line-height: 1.5; }
+  .fexplain .lbl { color: var(--muted); text-transform: uppercase; letter-spacing: .4px; font-size: 10px; display: block; margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -162,6 +187,33 @@
     var d = new Date(iso);
     if (isNaN(d)) return iso;
     return d.toLocaleString();
+  }
+
+  // Plain-English meaning by rule family (prefix before the dot in the rule id).
+  var RULE_FAMILY = {
+    PROC: 'Suspicious process attributes or behavior (unsigned, masquerading, odd location, or runtime memory flags).',
+    SVC: 'A Windows service with suspicious characteristics (unsigned binary, odd path, or hidden config).',
+    PERSIST: 'An auto-start / persistence mechanism that survives reboot (Run key, service, scheduled task, LSA/startup).',
+    NET: 'Suspicious network activity — possible command-and-control beacon, reverse shell, or IOC-matched endpoint.',
+    KEY: 'Possible keylogging — the process installs keyboard hooks or polls key state, often alongside network access.',
+    RK: 'User-mode rootkit hiding — a cross-view discrepancy where an artifact is visible to one API but hidden from another.',
+    CORR: 'A correlated implant — multiple independent detections landed on the same process/file, raising confidence.',
+    CRED: 'Credential-theft risk — a process is touching LSASS memory or sensitive credential files.',
+    MEM: 'Injected or unbacked code in memory — a reflective PE, hollowed process, or RWX shellcode region not backed by a file on disk.',
+    EVADE: 'Defense evasion — in-memory tampering of AMSI or ETW to blind security tooling.',
+    FILE: 'Malicious file content — a YARA rule or IOC string matched the scanned file.',
+    FIM: 'File-integrity / baseline change — a watched executable changed, or the baseline itself was tampered with.'
+  };
+  var ACTION_INFO = {
+    REVIEW: 'Investigate manually. The scanner did not auto-recommend a destructive action.',
+    KILL: 'Recommend terminating the offending process.',
+    SUSPEND: 'Recommend suspending the process so it can be captured for forensics before it is killed.',
+    DISABLE_SVC: 'Recommend disabling the service so it does not restart.',
+    QUARANTINE: 'Recommend quarantining the file (move + lock down) so it cannot execute.'
+  };
+  function ruleFamily(rule) {
+    var fam = String(rule || '').split('.')[0].toUpperCase();
+    return RULE_FAMILY[fam] || 'Triage finding. See the evidence line for specifics.';
   }
   function esc(s) {
     return String(s == null ? '' : s)
@@ -238,14 +290,37 @@
       } else {
         html += findings.map(function (f) {
           var sev = (f.severity || 'info').toLowerCase();
+          var hasConf = (f.confidence != null && f.confidence !== '');
+          var conf = Math.max(0, Math.min(100, parseInt(f.confidence, 10) || 0));
+          var action = String(f.recommended || '').toUpperCase();
+          var hasPid = (f.pid != null && f.pid !== '' && String(f.pid) !== '0');
+          var rows = '';
+          rows += '<dt>Rule ID</dt><dd>' + esc(f.rule || '(unknown)') + '</dd>';
+          rows += '<dt>Severity</dt><dd>' + esc(sev) + '</dd>';
+          if (hasConf) {
+            rows += '<dt>Confidence</dt><dd><span class="confbar"><i style="width:' + conf + '%"></i></span>' + conf + '%</dd>';
+          }
+          if (action) {
+            rows += '<dt>Action</dt><dd><span class="pill act-' + esc(action.toLowerCase()) + '">' + esc(action) + '</span></dd>';
+          }
+          if (hasPid) rows += '<dt>PID</dt><dd>' + esc(f.pid) + '</dd>';
+          if (f.target) rows += '<dt>Target</dt><dd>' + esc(f.target) + '</dd>';
           return '<div class="finding sev-' + esc(sev) + '">' +
             '<div class="row1">' +
               '<span class="sevtag sev-' + esc(sev) + '">' + esc(sev) + '</span>' +
               '<span class="rule">' + esc(f.rule || '(unknown)') + '</span>' +
+              '<span class="chev">▸</span>' +
             '</div>' +
             (f.title ? '<div class="title">' + esc(f.title) + '</div>' : '') +
-            (f.target ? '<div class="target">target: ' + esc(f.target) + (f.pid != null ? ' · pid ' + esc(f.pid) : '') + '</div>' : '') +
+            (f.target ? '<div class="target">target: ' + esc(f.target) + (hasPid ? ' · pid ' + esc(f.pid) : '') + '</div>' : '') +
             (f.evidence ? '<div class="evidence">' + esc(f.evidence) + '</div>' : '') +
+            '<div class="fdetail">' +
+              '<dl class="fgrid">' + rows + '</dl>' +
+              '<div class="fexplain">' +
+                '<span class="lbl">What this means</span>' + esc(ruleFamily(f.rule)) +
+                (action && ACTION_INFO[action] ? '<span class="lbl">Suggested response</span>' + esc(ACTION_INFO[action]) : '') +
+              '</div>' +
+            '</div>' +
             '</div>';
         }).join('');
       }
@@ -272,6 +347,15 @@
       if (sortKey === k) { sortDir = -sortDir; } else { sortKey = k; sortDir = (k === 'hostname' || k === 'lastSeen') ? 1 : -1; }
       renderFleet();
     });
+  });
+
+  // toggle a finding's drill-down when its header row is clicked (delegated,
+  // so it keeps working after the panel re-renders).
+  document.getElementById('detail').addEventListener('click', function (e) {
+    var row = e.target.closest('.row1');
+    if (!row) return;
+    var card = row.closest('.finding');
+    if (card) card.classList.toggle('open');
   });
 
   load();
