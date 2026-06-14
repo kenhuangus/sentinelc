@@ -1,0 +1,29 @@
+# SentinelC false-positive suppression list.
+#
+# Each line: <RULE_GLOB> <MATCHER>
+#   RULE_GLOB : exact rule id (PROC.RWX_MEM), a family (NET.*), or * (all rules)
+#   MATCHER   : one of
+#       sha256:<hex64>     drop when the finding's binary has this exact content
+#                          hash. The most precise option -- a trojaned file with
+#                          the same name will NOT inherit the pass.
+#       signer:<subject>   drop when the binary is VALIDLY signed and the
+#                          Authenticode subject contains this substring.
+#       path:<substring>   drop when the binary path / target contains this
+#                          substring (scoped to RULE_GLOB only).
+#
+# A line with a rule but no recognized matcher is ignored on purpose -- this
+# tool never blanket-mutes an entire rule, because that is how real malware
+# hides behind a suppressed detection.
+#
+# Add entries the easy way:
+#   sentinelc.exe --mark-fp PROC.RWX_MEM "C:\path\to\your-dev-tool.exe"
+# which hashes the file and appends a sha256: line below.
+#
+# Built-in auto-suppression (validly-signed binaries on noisy heuristic rules)
+# runs by default and needs no entries here. Disable it with --no-auto-fp.
+#
+# ---- examples (commented out) ----
+# PROC.RWX_MEM     signer:Microsoft Corporation
+# NET.LISTEN_SUSPICIOUS_PROC signer:Google LLC
+# PROC.RWX_MEM     path:chrome-headless-shell.exe
+# *                sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855

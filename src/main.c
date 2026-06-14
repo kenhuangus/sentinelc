@@ -76,6 +76,11 @@ static void print_help(const char *argv0)
         "  --ioc-dir PATH     Load IOC sets from a directory\n"
         "  --audit PATH       Write an audit log to PATH\n"
         "\n"
+        "False positives:\n"
+        "  --suppress PATH    Suppression file (default: rules\\suppress.txt)\n"
+        "  --no-auto-fp       Disable built-in auto-suppression of validly-signed noise\n"
+        "  --mark-fp RULE FILE  Hash FILE and whitelist RULE for it, then exit\n"
+        "\n"
         "  --help             Show this help and exit\n"
         "  --version          Show version and exit\n",
         SC_VERSION, prog);
@@ -216,6 +221,18 @@ static int parse_cli(int argc, char **argv, Config *cfg)
         if (strcmp(a, "--audit") == 0) {
             if (i + 1 >= argc) { fprintf(stderr, "--audit requires a path\n"); return 2; }
             copy_arg(cfg->audit_path, sizeof(cfg->audit_path), argv[++i]);
+            continue;
+        }
+        if (strcmp(a, "--suppress") == 0) {
+            if (i + 1 >= argc) { fprintf(stderr, "--suppress requires a path\n"); return 2; }
+            copy_arg(cfg->suppress_path, sizeof(cfg->suppress_path), argv[++i]);
+            continue;
+        }
+        if (strcmp(a, "--no-auto-fp") == 0) { cfg->no_auto_fp = true; continue; }
+        if (strcmp(a, "--mark-fp") == 0) {
+            if (i + 2 >= argc) { fprintf(stderr, "--mark-fp requires RULE and FILE\n"); return 2; }
+            copy_arg(cfg->mark_fp_rule, sizeof(cfg->mark_fp_rule), argv[++i]);
+            copy_arg(cfg->mark_fp_file, sizeof(cfg->mark_fp_file), argv[++i]);
             continue;
         }
 
@@ -429,6 +446,26 @@ int main(int argc, char **argv)
             snprintf(def, sizeof(def), "%s\\rules\\sentinelc.yar", exedir);
             ctx.yara = yara_load(def);           /* NULL if absent/empty */
         }
+        /* false-positive suppression list. Resolve the default path so both
+         * --mark-fp (append) and the scan (load) target the same file. */
+        if (!cfg.suppress_path[0] && exedir[0])
+            snprintf(cfg.suppress_path, sizeof(cfg.suppress_path),
+                     "%s\\rules\\suppress.txt", exedir);
+        suppress_load(cfg.suppress_path);        /* no-op if absent */
+    }
+
+    /* --mark-fp RULE FILE: hash the file, append a sha256 pin, and exit. */
+    if (cfg.mark_fp_rule[0]) {
+        int rc = suppress_mark_fp(cfg.suppress_path, cfg.mark_fp_rule, cfg.mark_fp_file);
+        if (ctx.ioc) ioc_free(ctx.ioc);
+        if (ctx.yara) yara_free(ctx.yara);
+        suppress_free();
+        allowlist_free();
+        sign_cache_free();
+        DeleteCriticalSection(&ctx.limit_lock);
+        proctable_free(&procs);
+        bus_free(&bus);
+        return rc;
     }
 
     /* ---- dispatch ---- */
@@ -444,6 +481,7 @@ int main(int argc, char **argv)
             ioc_free(ctx.ioc);
         if (ctx.yara)
             yara_free(ctx.yara);
+        suppress_free();
         allowlist_free();
         sign_cache_free();
         DeleteCriticalSection(&ctx.limit_lock);
@@ -483,8 +521,9 @@ int main(int argc, char **argv)
         run_scanners_parallel(&ctx, fns, names, n);
     }
 
-    /* ---- correlate, report, respond ---- */
+    /* ---- correlate, suppress false positives, report, respond ---- */
     correlate(&ctx);
+    suppress_apply(&ctx);
     report_render(&bus, &ctx);
 
     audit_open(cfg.audit_path[0] ? cfg.audit_path : NULL);
@@ -497,6 +536,7 @@ int main(int argc, char **argv)
         ioc_free(ctx.ioc);
     if (ctx.yara)
         yara_free(ctx.yara);
+    suppress_free();
     allowlist_free();
     sign_cache_free();
 

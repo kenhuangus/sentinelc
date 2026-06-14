@@ -99,6 +99,12 @@ typedef struct {
     char ioc_dir[SC_MAX_PATH];
     char audit_path[SC_MAX_PATH];
 
+    /* false-positive suppression (suppress.c) */
+    bool no_auto_fp;                  /* --no-auto-fp : disable layer-1 auto */
+    char suppress_path[SC_MAX_PATH];  /* --suppress PATH; empty => default */
+    char mark_fp_rule[SC_RULEID_LEN]; /* --mark-fp RULE FILE : append + exit */
+    char mark_fp_file[SC_MAX_PATH];
+
     /* integrity / Merkle FIM (appended; zero-init safe) */
     bool integrity_baseline;   /* --baseline : build/update baseline */
     bool integrity_check;      /* --integrity : diff vs baseline */
@@ -242,6 +248,20 @@ bool    name_is_masquerade(const char *image_path);
 void    allowlist_load(const char *path);        /* optional; safe if missing */
 bool    allowlist_match(const char *path_or_name);
 void    allowlist_free(void);
+
+/* =====================================================================
+ *  False-positive suppression (suppress.c)
+ * ===================================================================== */
+/* Load rules\suppress.txt (typed: sha256:/signer:/path:). Safe if missing. */
+void suppress_load(const char *path);
+/* Filter the bus in place: drop known-good findings. Call after correlate(),
+ * before report_render(). Layer 1 (signed-noise auto) honors cfg->no_auto_fp. */
+void suppress_apply(ScanCtx *c);
+void suppress_free(void);
+/* --mark-fp: hash `file`, append "<rule> sha256:<hash>" to suppress_path.
+ * Returns 0 on success. */
+int  suppress_mark_fp(const char *suppress_path, const char *rule_id,
+                      const char *file);
 
 /* =====================================================================
  *  IOC sets (ioc.c)
