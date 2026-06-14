@@ -27,11 +27,22 @@
 #include "sentinelc.h"
 
 #include <bcrypt.h>
+#include <wincrypt.h> /* CryptProtectData/CryptUnprotectData (DPAPI), link crypt32 */
+#include <aclapi.h>   /* GetNamedSecurityInfo / DACL inspection (best-effort) */
+#include <sddl.h>     /* ConvertSidToStringSidA (best-effort DACL warning) */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <io.h>      /* _isatty, _fileno (enumerating banner gating) */
+
+/* BCryptCreateHash needs the HMAC flag for keyed hashing; define if the SDK
+ * headers in this toolchain don't expose it. */
+#ifndef BCRYPT_ALG_HANDLE_HMAC_FLAG
+#define BCRYPT_ALG_HANDLE_HMAC_FLAG 0x00000008
+#endif
+
+#define FIM_MAC_KEY_BYTES 32   /* HMAC-SHA256 key length */
 
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(s) (((NTSTATUS)(s)) >= 0)
@@ -189,6 +200,360 @@ cleanup:
     free(buf);
     if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
     return ok;
+}
+
+/* ================================================================== */
+/* Baseline authentication: HMAC-SHA256 + DPAPI-wrapped key            */
+/* ================================================================== */
+/*
+ * Goal: detect that the baseline TSV was edited after it was created (e.g.
+ * malware deleting its own entry so a later --integrity diff shows "no
+ * change"), or that it was corrupted. We MAC the exact bytes of the written
+ * baseline file with HMAC-SHA256 under a per-baseline 32-byte random key, and
+ * store the MAC hex in `<baseline>.mac`. The key itself is never written in the
+ * clear: it is DPAPI-protected (CryptProtectData, LOCAL_MACHINE scope) into
+ * `<baseline>.key`, so any admin context on THIS machine can recompute/verify
+ * the MAC without the raw key ever touching disk.
+ *
+ * HONEST LIMITATION (do not overclaim): DPAPI with CRYPTPROTECT_LOCAL_MACHINE
+ * means the protection is bound to the machine, NOT to a specific user or
+ * secret the attacker lacks. A local attacker already running with admin on
+ * this same machine can call CryptUnprotectData on `<baseline>.key`, recover
+ * the key, tamper with the baseline, and re-MAC it -- producing a forged MAC
+ * that verifies clean. This MAC therefore defeats OFFLINE tampering (editing
+ * the .tsv on another machine or without admin), naive edits that forget the
+ * sidecars, and accidental corruption -- but it does NOT defeat a
+ * fully-privileged on-box attacker. Defeating that requires a key the local
+ * machine cannot itself unwrap (HSM/TPM-sealed, remote attestation, or an
+ * off-box verifier), which is out of scope here. The DACL check below is
+ * defense-in-depth, not a substitute.
+ */
+
+/* HMAC-SHA256 over a memory buffer using `key` (keylen bytes) -> 32 raw bytes.
+ * false on error. Frees/closes every BCrypt handle and allocation on all
+ * paths. */
+static bool hmac_sha256_buf(const uint8_t *key, size_t keylen,
+                            const uint8_t *data, size_t len, uint8_t out[32])
+{
+    bool ok = false;
+    BCRYPT_ALG_HANDLE  hAlg  = NULL;
+    BCRYPT_HASH_HANDLE hHash = NULL;
+    PBYTE  hashObj = NULL;
+    DWORD  cbHashObj = 0, cbData = 0;
+
+    if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM,
+                                                NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG)))
+        return false;
+    if (!NT_SUCCESS(BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH,
+                                      (PBYTE)&cbHashObj, sizeof cbHashObj, &cbData, 0)))
+        goto cleanup;
+    hashObj = (PBYTE)malloc(cbHashObj);
+    if (!hashObj) goto cleanup;
+    /* pass the key to BCryptCreateHash -> keyed (HMAC) hash */
+    if (!NT_SUCCESS(BCryptCreateHash(hAlg, &hHash, hashObj, cbHashObj,
+                                     (PUCHAR)key, (ULONG)keylen, 0)))
+        goto cleanup;
+    if (len && !NT_SUCCESS(BCryptHashData(hHash, (PUCHAR)data, (ULONG)len, 0)))
+        goto cleanup;
+    if (!NT_SUCCESS(BCryptFinishHash(hHash, out, 32, 0)))
+        goto cleanup;
+    ok = true;
+
+cleanup:
+    if (hHash) BCryptDestroyHash(hHash);
+    if (hAlg)  BCryptCloseAlgorithmProvider(hAlg, 0);
+    free(hashObj);
+    return ok;
+}
+
+/* Read the entire file at `file_path` (UTF-8) into a heap buffer. Returns the
+ * buffer (caller frees) and sets *out_len; NULL on any error / missing file. */
+static uint8_t *read_file_all(const char *file_path, size_t *out_len)
+{
+    *out_len = 0;
+    wchar_t w[SC_MAX_PATH * 2];
+    if (utf8_to_wide(file_path, w, SC_MAX_PATH * 2) == 0) return NULL;
+
+    HANDLE h = CreateFileW(w, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+
+    LARGE_INTEGER li;
+    if (!GetFileSizeEx(h, &li) || li.QuadPart < 0 ||
+        (uint64_t)li.QuadPart > (256ull * 1024ull * 1024ull)) {
+        /* refuse absurd sizes; a baseline TSV is well under this */
+        CloseHandle(h);
+        return NULL;
+    }
+    size_t sz = (size_t)li.QuadPart;
+    uint8_t *buf = (uint8_t *)malloc(sz ? sz : 1);
+    if (!buf) { CloseHandle(h); return NULL; }
+
+    size_t got = 0;
+    while (got < sz) {
+        DWORD rd = 0;
+        DWORD want = (DWORD)((sz - got > 0x100000) ? 0x100000 : (sz - got));
+        if (!ReadFile(h, buf + got, want, &rd, NULL) || rd == 0) {
+            free(buf);
+            CloseHandle(h);
+            return NULL;
+        }
+        got += rd;
+    }
+    CloseHandle(h);
+    *out_len = sz;
+    return buf;
+}
+
+/* Build "<base><suffix>" (e.g. ".mac" / ".key") into out (bounded). */
+static void sidecar_path(const char *base, const char *suffix,
+                         char *out, size_t cap)
+{
+    snprintf(out, cap, "%s%s", base, suffix);
+}
+
+/* Write `text` (a NUL-terminated string) to `path` as raw bytes. */
+static bool write_text_file(const char *path, const char *text)
+{
+    wchar_t w[SC_MAX_PATH * 2];
+    if (utf8_to_wide(path, w, SC_MAX_PATH * 2) == 0) return false;
+    FILE *f = _wfopen(w, L"wb");
+    if (!f) return false;
+    size_t n = strlen(text);
+    bool ok = (n == 0) || (fwrite(text, 1, n, f) == n);
+    fclose(f);
+    return ok;
+}
+
+/* Write a DPAPI blob (raw bytes) to `path`. */
+static bool write_blob_file(const char *path, const uint8_t *data, size_t len)
+{
+    wchar_t w[SC_MAX_PATH * 2];
+    if (utf8_to_wide(path, w, SC_MAX_PATH * 2) == 0) return false;
+    FILE *f = _wfopen(w, L"wb");
+    if (!f) return false;
+    bool ok = (len == 0) || (fwrite(data, 1, len, f) == len);
+    fclose(f);
+    return ok;
+}
+
+/* Load-or-create the 32-byte MAC key for this baseline.
+ *
+ * If `<baseline>.key` exists: read the DPAPI blob and CryptUnprotectData it to
+ * recover the raw key (reuse across re-baselines so old .mac files stay
+ * verifiable until rewritten). Otherwise: BCryptGenRandom 32 bytes, DPAPI-
+ * protect them (LOCAL_MACHINE scope) and write the blob to `<baseline>.key`.
+ *
+ * On success fills key_out[32] and returns true. The raw key is wiped from any
+ * intermediate buffer before free. */
+static bool load_or_create_mac_key(const char *baseline_path,
+                                   uint8_t key_out[FIM_MAC_KEY_BYTES])
+{
+    char keypath[SC_MAX_PATH * 2];
+    sidecar_path(baseline_path, ".key", keypath, sizeof keypath);
+
+    /* try to reuse an existing key */
+    size_t bloblen = 0;
+    uint8_t *blob = read_file_all(keypath, &bloblen);
+    if (blob && bloblen > 0) {
+        DATA_BLOB in, out;
+        in.pbData = blob;
+        in.cbData = (DWORD)bloblen;
+        out.pbData = NULL;
+        out.cbData = 0;
+        bool ok = false;
+        if (CryptUnprotectData(&in, NULL, NULL, NULL, NULL,
+                               CRYPTPROTECT_LOCAL_MACHINE, &out)) {
+            if (out.cbData == FIM_MAC_KEY_BYTES) {
+                memcpy(key_out, out.pbData, FIM_MAC_KEY_BYTES);
+                ok = true;
+            }
+            if (out.pbData) {
+                SecureZeroMemory(out.pbData, out.cbData);
+                LocalFree(out.pbData);
+            }
+        }
+        free(blob);
+        if (ok) return true;
+        /* fall through: unreadable/garbage key -> regenerate below */
+    } else {
+        free(blob);
+    }
+
+    /* generate a fresh random key */
+    uint8_t raw[FIM_MAC_KEY_BYTES];
+    if (!NT_SUCCESS(BCryptGenRandom(NULL, raw, FIM_MAC_KEY_BYTES,
+                                    BCRYPT_USE_SYSTEM_PREFERRED_RNG))) {
+        return false;
+    }
+
+    /* DPAPI-protect (machine scope) and persist the blob */
+    DATA_BLOB in, out;
+    in.pbData = raw;
+    in.cbData = FIM_MAC_KEY_BYTES;
+    out.pbData = NULL;
+    out.cbData = 0;
+    bool protected_ok = CryptProtectData(&in, L"SentinelC FIM baseline key",
+                                         NULL, NULL, NULL,
+                                         CRYPTPROTECT_LOCAL_MACHINE, &out);
+    bool ok = false;
+    if (protected_ok) {
+        if (write_blob_file(keypath, out.pbData, out.cbData)) {
+            memcpy(key_out, raw, FIM_MAC_KEY_BYTES);
+            ok = true;
+        }
+        if (out.pbData) LocalFree(out.pbData);
+    }
+    SecureZeroMemory(raw, sizeof raw);
+    return ok;
+}
+
+/* Compute HMAC-SHA256 over the current bytes of `baseline_path` using `key`,
+ * writing the 64-char hex digest into mac_hex (>=65). false on error. */
+static bool compute_baseline_mac(const char *baseline_path,
+                                 const uint8_t key[FIM_MAC_KEY_BYTES],
+                                 char mac_hex[65])
+{
+    size_t len = 0;
+    uint8_t *bytes = read_file_all(baseline_path, &len);
+    if (!bytes) return false;
+    uint8_t mac[32];
+    bool ok = hmac_sha256_buf(key, FIM_MAC_KEY_BYTES, bytes, len, mac);
+    free(bytes);
+    if (ok) hex_encode(mac, 32, mac_hex);
+    return ok;
+}
+
+/* After a successful baseline_write, authenticate it: load/create the key,
+ * MAC the file, and write `<baseline>.mac`. Best-effort; returns true only if
+ * the .mac was written. */
+static bool authenticate_baseline(const char *baseline_path)
+{
+    uint8_t key[FIM_MAC_KEY_BYTES];
+    bool ok = false;
+    if (load_or_create_mac_key(baseline_path, key)) {
+        char mac_hex[65];
+        if (compute_baseline_mac(baseline_path, key, mac_hex)) {
+            char macpath[SC_MAX_PATH * 2];
+            sidecar_path(baseline_path, ".mac", macpath, sizeof macpath);
+            ok = write_text_file(macpath, mac_hex);
+        }
+    }
+    SecureZeroMemory(key, sizeof key);
+    return ok;
+}
+
+/* Verification result for a loaded baseline's authentication. */
+typedef enum {
+    MAC_OK = 0,       /* .mac + .key present and the recomputed MAC matches */
+    MAC_MISSING,      /* .mac or .key absent (old/unauthenticated baseline) */
+    MAC_MISMATCH,     /* present but recomputed MAC != stored MAC -> tampered */
+    MAC_ERROR         /* internal error verifying (treat like missing) */
+} MacVerdict;
+
+/* Verify the baseline's MAC. Reads `<baseline>.mac` (expected hex) and
+ * `<baseline>.key` (DPAPI key), recomputes the HMAC over the current baseline
+ * bytes, and compares. */
+static MacVerdict verify_baseline_mac(const char *baseline_path)
+{
+    char macpath[SC_MAX_PATH * 2], keypath[SC_MAX_PATH * 2];
+    sidecar_path(baseline_path, ".mac", macpath, sizeof macpath);
+    sidecar_path(baseline_path, ".key", keypath, sizeof keypath);
+
+    /* both sidecars must exist to authenticate */
+    size_t maclen = 0;
+    uint8_t *macbytes = read_file_all(macpath, &maclen);
+    if (!macbytes) return MAC_MISSING;
+
+    size_t keylen = 0;
+    uint8_t *keytest = read_file_all(keypath, &keylen);
+    if (!keytest) { free(macbytes); return MAC_MISSING; }
+    free(keytest);   /* presence check only; load below recovers the key */
+
+    /* stored MAC hex (trim trailing whitespace/newline); must be 64 hex chars */
+    char stored[65];
+    size_t n = maclen < 64 ? maclen : 64;
+    memcpy(stored, macbytes, n);
+    stored[n] = '\0';
+    free(macbytes);
+    uint8_t dummy[32];
+    if (n != 64 || !hex_decode32(stored, dummy)) return MAC_MISMATCH;
+
+    /* recover the key and recompute */
+    uint8_t key[FIM_MAC_KEY_BYTES];
+    if (!load_or_create_mac_key(baseline_path, key)) {
+        /* note: if .key existed but unwrap failed, load_or_create would have
+         * regenerated a NEW key -> recomputed MAC can't match the stored one.
+         * That correctly surfaces as MISMATCH below rather than a false OK. */
+        SecureZeroMemory(key, sizeof key);
+        return MAC_ERROR;
+    }
+    char recomputed[65];
+    bool ok = compute_baseline_mac(baseline_path, key, recomputed);
+    SecureZeroMemory(key, sizeof key);
+    if (!ok) return MAC_ERROR;
+
+    /* constant-time-ish compare over the fixed 64-char hex */
+    unsigned diff = 0;
+    for (int i = 0; i < 64; i++)
+        diff |= (unsigned)(stored[i] ^ recomputed[i]);
+    return diff == 0 ? MAC_OK : MAC_MISMATCH;
+}
+
+/* Defense-in-depth: warn (ctx_note_limit) if the baseline file's DACL grants
+ * write access to principals other than Administrators / SYSTEM. A user-
+ * writable baseline is weaker regardless of the MAC, because a non-admin can
+ * still delete/replace both the .tsv and (with LOCAL_MACHINE DPAPI) re-MAC it.
+ * Best-effort: any failure to read the ACL is silently ignored. */
+static void warn_if_baseline_world_writable(ScanCtx *c, const char *baseline_path)
+{
+    wchar_t w[SC_MAX_PATH * 2];
+    if (utf8_to_wide(baseline_path, w, SC_MAX_PATH * 2) == 0) return;
+
+    PACL pDacl = NULL;
+    PSECURITY_DESCRIPTOR pSD = NULL;
+    if (GetNamedSecurityInfoW(w, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                              NULL, NULL, &pDacl, NULL, &pSD) != ERROR_SUCCESS)
+        return;
+    if (!pDacl) { if (pSD) LocalFree(pSD); return; }
+
+    /* well-known SIDs we consider "trusted" to have write */
+    PSID sidAdmins = NULL, sidSystem = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+    AllocateAndInitializeSid(&ntAuth, 2, SECURITY_BUILTIN_DOMAIN_RID,
+                             DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &sidAdmins);
+    AllocateAndInitializeSid(&ntAuth, 1, SECURITY_LOCAL_SYSTEM_RID,
+                             0, 0, 0, 0, 0, 0, 0, &sidSystem);
+
+    const DWORD WRITE_BITS = FILE_WRITE_DATA | FILE_APPEND_DATA |
+                             WRITE_DAC | WRITE_OWNER | DELETE | GENERIC_WRITE |
+                             GENERIC_ALL;
+    bool weak = false;
+    for (DWORD i = 0; i < pDacl->AceCount && !weak; i++) {
+        LPVOID ace = NULL;
+        if (!GetAce(pDacl, i, &ace)) continue;
+        ACE_HEADER *hdr = (ACE_HEADER *)ace;
+        if (hdr->AceType != ACCESS_ALLOWED_ACE_TYPE) continue;
+        ACCESS_ALLOWED_ACE *aa = (ACCESS_ALLOWED_ACE *)ace;
+        if ((aa->Mask & WRITE_BITS) == 0) continue;
+        PSID s = (PSID)&aa->SidStart;
+        if (!IsValidSid(s)) continue;
+        bool trusted =
+            (sidAdmins && EqualSid(s, sidAdmins)) ||
+            (sidSystem && EqualSid(s, sidSystem));
+        if (!trusted)
+            weak = true;   /* a non-admin/non-SYSTEM principal can write */
+    }
+
+    if (sidAdmins) FreeSid(sidAdmins);
+    if (sidSystem) FreeSid(sidSystem);
+    if (pSD) LocalFree(pSD);
+
+    if (weak)
+        ctx_note_limit(c, "FIM baseline file DACL grants write to a non-admin/"
+                          "non-SYSTEM principal; a user-writable baseline is "
+                          "weaker regardless of the MAC (%s)", baseline_path);
 }
 
 /* ================================================================== */
@@ -940,6 +1305,17 @@ static void run_baseline(ScanCtx *c, RootSet *roots)
     merkle_root(&list, root_hex);
 
     bool wrote = baseline_write(bpath, &list, root_hex, roots_joined);
+
+    /* Authenticate the baseline so later --integrity runs can prove it was not
+     * edited since creation: HMAC-SHA256 the written file under a DPAPI-wrapped
+     * 32-byte key, store the MAC in <baseline>.mac (key blob in <baseline>.key).
+     * See authenticate_baseline() for the honest DPAPI limitation. */
+    bool authed = false;
+    if (wrote) {
+        authed = authenticate_baseline(bpath);
+        warn_if_baseline_world_writable(c, bpath);
+    }
+
     double secs = (GetTickCount() - t0) / 1000.0;
 
     if (c->cfg->json) {
@@ -947,8 +1323,8 @@ static void run_baseline(ScanCtx *c, RootSet *roots)
                list.count, root_hex);
         printf("\"baseline_file\":");
         json_print_escaped(stdout, bpath);
-        printf(",\"elapsed_seconds\":%.2f,\"written\":%s",
-               secs, wrote ? "true" : "false");
+        printf(",\"elapsed_seconds\":%.2f,\"written\":%s,\"authenticated\":%s",
+               secs, wrote ? "true" : "false", authed ? "true" : "false");
         if (skipped[0]) { printf(",\"skipped_roots\":"); json_print_escaped(stdout, skipped); }
         printf("}\n");
     } else {
@@ -956,13 +1332,18 @@ static void run_baseline(ScanCtx *c, RootSet *roots)
         printf("  Files indexed : %zu\n", list.count);
         printf("  Merkle root   : %s\n", root_hex);
         printf("  Baseline file : %s%s\n", bpath, wrote ? "" : "  (WRITE FAILED)");
+        if (wrote)
+            printf("  Authenticated : %s\n",
+                   authed ? "yes (HMAC-SHA256, DPAPI-wrapped key -> .mac/.key)"
+                          : "NO (could not write .mac/.key -- baseline is unauthenticated)");
         printf("  Elapsed       : %.2f s\n", secs);
         if (skipped[0])
             printf("  Skipped roots : %s\n", skipped);
     }
 
-    audit_logf("FIM baseline: root=%s count=%zu file=%s%s",
-               root_hex, list.count, bpath, wrote ? "" : " (WRITE FAILED)");
+    audit_logf("FIM baseline: root=%s count=%zu file=%s%s authenticated=%s",
+               root_hex, list.count, bpath, wrote ? "" : " (WRITE FAILED)",
+               authed ? "true" : "false");
 
     list_free(&list);
 }
@@ -985,6 +1366,33 @@ static void run_check(ScanCtx *c, RootSet *roots, bool roots_from_cli)
         list_free(&base);
         return;
     }
+
+    /* ---- authenticate the baseline before trusting any diff ----
+     * Recompute the HMAC over the current baseline bytes and compare to the
+     * stored <baseline>.mac. Missing sidecars => unauthenticated old baseline
+     * (note + proceed, back-compat). Mismatch => the baseline was edited since
+     * creation (or corrupted): the diff results cannot be trusted, so emit a
+     * loud HIGH finding but still run the diff so the operator sees something. */
+    MacVerdict mv = verify_baseline_mac(bpath);
+    if (mv == MAC_MISSING || mv == MAC_ERROR) {
+        ctx_note_limit(c, "FIM baseline is not authenticated (no .mac/.key); "
+                          "cannot verify it was not tampered (%s)", bpath);
+    } else if (mv == MAC_MISMATCH) {
+        bus_emit(c->bus, "FIM.BASELINE_TAMPERED", SEV_HIGH, 90, ACT_REVIEW, 0,
+                 bpath,
+                 "FIM baseline failed HMAC authentication",
+                 "baseline HMAC mismatch -- the baseline was modified since it "
+                 "was created; integrity results cannot be trusted. Re-baseline "
+                 "from a known-good state.");
+        if (!c->cfg->json)
+            printf("\n*** WARNING: FIM.BASELINE_TAMPERED -- baseline HMAC "
+                   "mismatch. The baseline at %s was modified since it was "
+                   "created; integrity results below cannot be trusted. "
+                   "Re-baseline from a known-good state. ***\n\n", bpath);
+        audit_logf("FIM check: BASELINE_TAMPERED (HMAC mismatch) file=%s", bpath);
+    }
+    /* defense-in-depth: a user-writable baseline is weaker regardless of MAC */
+    warn_if_baseline_world_writable(c, bpath);
 
     /* If the caller didn't pass roots, re-use the baseline's recorded scope so
      * the check matches the baseline exactly. */
