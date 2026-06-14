@@ -129,6 +129,7 @@ typedef struct {
 
 /* ---- IOC sets (loaded once, read by scanners) ---- */
 typedef struct IocSet IocSet;        /* opaque, defined in ioc.c */
+typedef struct YaraRules YaraRules;  /* opaque, defined in yara_lite.c */
 
 /* ---- shared scan context handed to every scanner ---- */
 typedef struct {
@@ -136,6 +137,7 @@ typedef struct {
     FindingBus *bus;
     ProcTable  *procs;     /* shared cache; scan_process fills it first */
     IocSet     *ioc;       /* may be NULL */
+    YaraRules  *yara;      /* compiled YARA-subset rules; may be NULL */
     bool        is_admin;
     bool        have_debug_priv;
     /* limitations accumulator (thread-safe append) */
@@ -305,5 +307,25 @@ void progress_step(ProgressBar *p, uint64_t units_done, const char *current_item
 
 /* Finish: draw the final line at 100%, emit a newline, flush, free. NULL-safe. */
 void progress_end(ProgressBar *p);
+
+/* =====================================================================
+ *  YARA-subset rule engine (yara_lite.c)
+ * =====================================================================
+ * Generic byte/text pattern matcher over a focused subset of YARA syntax.
+ * Pure C, libc only. Parses `rule <Name> { strings: ... condition: ... }`
+ * rule files; text strings support ascii/wide/nocase modifiers; hex strings
+ * support full-byte `??` wildcards; conditions support
+ *   any of them | all of them | <N> of them | flat $a and/or $b
+ * (unrecognized conditions fall back to "any of them"). Caps: <=1024 rules,
+ * <=64 strings/rule, <=256 pattern bytes, <=64-char rule names. Malformed
+ * input is skipped, never fatal.
+ */
+typedef struct YaraRules YaraRules;            /* opaque */
+YaraRules *yara_load(const char *path);        /* parse a .yar file; NULL if missing/empty/none */
+void       yara_free(YaraRules *y);
+/* Scan buf; on the first rule whose condition is satisfied, copy its name to
+ * out (bounded) and return true. false if nothing matched. */
+bool       yara_scan(YaraRules *y, const unsigned char *buf, size_t len,
+                     char *out, size_t cap);
 
 #endif /* SENTINELC_H */

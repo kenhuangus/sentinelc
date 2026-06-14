@@ -151,7 +151,7 @@ static uint64_t count_files(const char *dir, int depth)
 /* Read up to cap-1 bytes of a file into buf and NUL-terminate. Embedded NUL
  * bytes are replaced with spaces so ASCII markers inside binaries still match a
  * substring search. Returns bytes read (0 on error). */
-static size_t read_file_text(const char *path, char *buf, size_t cap)
+static size_t read_file_text(const char *path, char *buf, size_t cap, bool strip)
 {
     if (cap == 0) return 0;
     wchar_t wpath[SC_MAX_PATH * 2];
@@ -165,8 +165,11 @@ static size_t read_file_text(const char *path, char *buf, size_t cap)
     BOOL ok = ReadFile(h, buf, (DWORD)(cap - 1), &rd, NULL);
     CloseHandle(h);
     if (!ok) return 0;
-    for (DWORD i = 0; i < rd; i++)
-        if (buf[i] == '\0') buf[i] = ' ';
+    /* strip=true: NUL -> space for the NUL-terminated substring IOC matcher.
+     * strip=false: keep raw bytes (YARA wide/hex patterns rely on the NULs). */
+    if (strip)
+        for (DWORD i = 0; i < rd; i++)
+            if (buf[i] == '\0') buf[i] = ' ';
     buf[rd] = '\0';
     return rd;
 }
@@ -261,16 +264,32 @@ static void scan_one_file(ScanCtx *c, const char *path)
         }
     }
 
-    /* ---- FILE.IOC_STRING ---- content contains a loaded string IOC ---- */
-    if (c->ioc) {
+    /* ---- content checks: YARA-subset rules (raw bytes) + string IOC ---- */
+    if (c->yara || c->ioc) {
         /* 1 MiB scan window; single-threaded scanner so a static is safe and
-         * avoids a per-file allocation. */
+         * avoids a per-file allocation. Read RAW (no NUL strip) for YARA. */
         static char content[1u << 20];
-        size_t got = read_file_text(path, content, sizeof content);
-        if (got > 0 && ioc_match_string(c->ioc, content)) {
-            bus_emit(c->bus, "FILE.IOC_STRING", SEV_HIGH, 90, ACT_QUARANTINE,
-                     0, path, "File content matches a known-bad string IOC",
-                     "matched a loaded indicator (yara-subset/C2 domain)");
+        size_t got = read_file_text(path, content, sizeof content, false);
+        if (got > 0) {
+            char rulename[80];
+            if (c->yara &&
+                yara_scan(c->yara, (const unsigned char *)content, got,
+                          rulename, sizeof rulename)) {
+                bus_emit(c->bus, "FILE.YARA_MATCH", SEV_HIGH, 85, ACT_QUARANTINE,
+                         0, path, "File content matches a YARA rule",
+                         "matched YARA rule '%s'", rulename);
+            }
+            /* the string IOC matcher is NUL-terminated; strip embedded NULs. */
+            if (c->ioc) {
+                for (size_t i = 0; i < got; i++)
+                    if (content[i] == '\0') content[i] = ' ';
+                content[got] = '\0';
+                if (ioc_match_string(c->ioc, content)) {
+                    bus_emit(c->bus, "FILE.IOC_STRING", SEV_HIGH, 90, ACT_QUARANTINE,
+                             0, path, "File content matches a known-bad string IOC",
+                             "matched a loaded indicator (string/C2 domain)");
+                }
+            }
         }
     }
 }

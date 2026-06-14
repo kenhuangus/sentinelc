@@ -386,6 +386,7 @@ int main(int argc, char **argv)
     ctx.bus   = &bus;
     ctx.procs = &procs;
     ctx.ioc   = NULL;
+    ctx.yara  = NULL;
     InitializeCriticalSection(&ctx.limit_lock);
     ctx.limitations[0] = '\0';
 
@@ -422,6 +423,12 @@ int main(int argc, char **argv)
             snprintf(def, sizeof(def), "%s\\rules", exedir);
             ctx.ioc = ioc_load(def);             /* NULL if absent/empty */
         }
+        /* compiled YARA-subset rules: rules\sentinelc.yar next to the exe */
+        if (exedir[0]) {
+            char def[SC_MAX_PATH];
+            snprintf(def, sizeof(def), "%s\\rules\\sentinelc.yar", exedir);
+            ctx.yara = yara_load(def);           /* NULL if absent/empty */
+        }
     }
 
     /* ---- dispatch ---- */
@@ -435,6 +442,8 @@ int main(int argc, char **argv)
 
         if (ctx.ioc)
             ioc_free(ctx.ioc);
+        if (ctx.yara)
+            yara_free(ctx.yara);
         allowlist_free();
         sign_cache_free();
         DeleteCriticalSection(&ctx.limit_lock);
@@ -486,6 +495,8 @@ int main(int argc, char **argv)
     /* ---- teardown ---- */
     if (ctx.ioc)
         ioc_free(ctx.ioc);
+    if (ctx.yara)
+        yara_free(ctx.yara);
     allowlist_free();
     sign_cache_free();
 
