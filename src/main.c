@@ -458,8 +458,8 @@ int main(int argc, char **argv)
         }
 
         /* remaining scanners run concurrently */
-        ScanFn fns[8];
-        const char *names[8];
+        ScanFn fns[12];
+        const char *names[12];
         size_t n = 0;
         fns[n] = scan_service;  names[n] = "service";    n++;
         fns[n] = scan_persist;  names[n] = "persistence"; n++;
@@ -469,6 +469,7 @@ int main(int argc, char **argv)
             fns[n] = scan_rootkit; names[n] = "rootkit";   n++;
             fns[n] = scan_creds;   names[n] = "cred-access"; n++;
             fns[n] = scan_memscan; names[n] = "memory";    n++;
+            fns[n] = scan_evade;   names[n] = "amsi/etw";  n++;
         }
         run_scanners_parallel(&ctx, fns, names, n);
     }
