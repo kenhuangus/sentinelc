@@ -19,3 +19,4 @@ baseline*
 *.swp
 .DS_Store
 Thumbs.db
+.gstack/
