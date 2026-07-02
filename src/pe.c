@@ -228,6 +228,40 @@ static void classify_import(const char *fn, PeInfo *out)
     if (ieq(fn, "RegisterRawInputDevices") || ieq(fn, "GetRawInputData"))
         out->imp_rawinput_api = true;
 
+    /* Clipboard/input theft. Clipboard polling/listening plus egress is a
+     * common infostealer shape and is part of MITRE ATT&CK Input Capture. */
+    if (ieq(fn, "OpenClipboard") || ieq(fn, "GetClipboardData") ||
+        ieq(fn, "EnumClipboardFormats") ||
+        ieq(fn, "GetPriorityClipboardFormat") ||
+        ieq(fn, "IsClipboardFormatAvailable") ||
+        ieq(fn, "AddClipboardFormatListener") ||
+        ieq(fn, "RemoveClipboardFormatListener") ||
+        ieq(fn, "SetClipboardViewer") || ieq(fn, "ChangeClipboardChain") ||
+        istartswith(fn, "RegisterClipboardFormat"))
+        out->imp_clipboard_api = true;
+
+    /* Screen capture. Avoid ultra-broad GetDC-only signals; these APIs are
+     * stronger indicators of screenshot/desktop capture capability. */
+    if (ieq(fn, "BitBlt") || ieq(fn, "StretchBlt") ||
+        ieq(fn, "PrintWindow") || ieq(fn, "CreateCompatibleBitmap") ||
+        ieq(fn, "CreateDIBSection") || ieq(fn, "GetWindowDC") ||
+        ieq(fn, "GetDesktopWindow"))
+        out->imp_screen_api = true;
+
+    /* Microphone/camera capture capability. */
+    if (istartswith(fn, "waveIn") || istartswith(fn, "capCreateCaptureWindow") ||
+        ieq(fn, "MFEnumDeviceSources") || ieq(fn, "MFCreateDeviceSource") ||
+        ieq(fn, "MFCreateSourceReaderFromMediaSource"))
+        out->imp_media_capture_api = true;
+
+    /* Secret-read APIs used by credential grabbers. CryptUnprotectData is
+     * broad by itself, so downstream rules require other risk signals too. */
+    if (istartswith(fn, "CredRead") || istartswith(fn, "CredEnumerate") ||
+        ieq(fn, "CryptUnprotectData") || ieq(fn, "VaultEnumerateVaults") ||
+        ieq(fn, "VaultOpenVault") || ieq(fn, "VaultGetItem") ||
+        ieq(fn, "PStoreCreateInstance"))
+        out->imp_cred_api = true;
+
     /* Networking (function-name signal; DLL-name signal handled separately) */
     if (ieq(fn, "connect") || ieq(fn, "send") || ieq(fn, "WSASocketW") ||
         ieq(fn, "WSASocketA") || ieq(fn, "WSAConnect") ||

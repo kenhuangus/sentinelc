@@ -174,6 +174,40 @@ static size_t read_file_text(const char *path, char *buf, size_t cap, bool strip
     return rd;
 }
 
+static bool yara_rule_applies_to_file(const char *rule, bool is_pe)
+{
+    if (!rule || !is_pe)
+        return true;
+
+    /* These generic rules describe script/document payloads. PE files often
+     * contain the same strings in benign detector logic, docs, or resources. */
+    if (_stricmp(rule, "Obfuscated_PowerShell") == 0 ||
+        _stricmp(rule, "Script_Dropper_Markers") == 0 ||
+        _stricmp(rule, "Embedded_PE_In_Nonexe") == 0)
+        return false;
+
+    return true;
+}
+
+static bool is_current_scanner_image(const char *path)
+{
+    if (!path || !path[0])
+        return false;
+    char self[SC_MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, self, sizeof(self));
+    if (n == 0 || n >= sizeof(self))
+        return false;
+    self[sizeof(self) - 1] = '\0';
+
+    char full[SC_MAX_PATH];
+    DWORD m = GetFullPathNameA(path, sizeof(full), full, NULL);
+    if (m == 0 || m >= sizeof(full))
+        return false;
+    full[sizeof(full) - 1] = '\0';
+
+    return _stricmp(self, full) == 0;
+}
+
 /* Examine a single file and emit findings. */
 static void scan_one_file(ScanCtx *c, const char *path)
 {
@@ -186,6 +220,7 @@ static void scan_one_file(ScanCtx *c, const char *path)
 
     PathLoc loc = path_classify(path);
     bool user_writable = path_is_user_writable(path);
+    bool self_image = is_current_scanner_image(path);
 
     /* ---- signature (PE only; non-PE files aren't Authenticode targets) ---- */
     SignVerdict sv = SIGN_UNKNOWN;
@@ -229,23 +264,36 @@ static void scan_one_file(ScanCtx *c, const char *path)
     }
 
     /* ---- FILE.SUSPICIOUS_CAPS ---- (PE in user-writable/temp) ---- */
-    if (is_pe && (user_writable || loc == PATHLOC_TEMP ||
+    if (!self_image && is_pe && (user_writable || loc == PATHLOC_TEMP ||
                   loc == PATHLOC_USER_WRITABLE)) {
         bool hook_net    = pe.imp_hook_api    && pe.imp_net_api;
         bool inject_net  = pe.imp_proc_inject_api && pe.imp_net_api;
         bool keystate_net = pe.imp_keystate_api && pe.imp_net_api;
-        if (hook_net || inject_net || keystate_net) {
+        bool clipboard_net = pe.imp_clipboard_api && pe.imp_net_api;
+        bool screen_net = pe.imp_screen_api && pe.imp_net_api;
+        bool media_net = pe.imp_media_capture_api && pe.imp_net_api;
+        bool cred_net = pe.imp_cred_api && pe.imp_net_api;
+        if (hook_net || inject_net || keystate_net || clipboard_net ||
+            screen_net || media_net || cred_net) {
             const char *combo = inject_net  ? "process-injection + network" :
                                 hook_net     ? "windows-hook + network" :
-                                               "keystate-capture + network";
+                                keystate_net ? "keystate-capture + network" :
+                                clipboard_net ? "clipboard-capture + network" :
+                                screen_net ? "screen-capture + network" :
+                                media_net ? "media-capture + network" :
+                                             "credential-api + network";
             bus_emit(c->bus, "FILE.SUSPICIOUS_CAPS", SEV_MED, 75, ACT_REVIEW,
                      0, path,
                      "Executable in user-writable path with dangerous imports",
-                     "imports: %s%s%s%s%s",
+                     "imports: %s%s%s%s%s%s%s%s%s",
                      combo,
                      pe.imp_crypt_api      ? " +crypt"   : "",
                      pe.imp_rawinput_api   ? " +rawinput": "",
                      pe.imp_hook_api       ? " +hook"    : "",
+                     pe.imp_clipboard_api  ? " +clipboard" : "",
+                     pe.imp_screen_api     ? " +screen" : "",
+                     pe.imp_media_capture_api ? " +media" : "",
+                     pe.imp_cred_api       ? " +cred-api" : "",
                      pe.looks_packed       ? " +packed"  : "");
         }
     }
@@ -274,7 +322,8 @@ static void scan_one_file(ScanCtx *c, const char *path)
             char rulename[80];
             if (c->yara &&
                 yara_scan(c->yara, (const unsigned char *)content, got,
-                          rulename, sizeof rulename)) {
+                          rulename, sizeof rulename) &&
+                yara_rule_applies_to_file(rulename, is_pe)) {
                 bus_emit(c->bus, "FILE.YARA_MATCH", SEV_HIGH, 85, ACT_QUARANTINE,
                          0, path, "File content matches a YARA rule",
                          "matched YARA rule '%s'", rulename);

@@ -82,6 +82,44 @@ static bool ci_contains_local(const char *hay, const char *needle)
     return false;
 }
 
+static bool fullpath_equal_local(const char *a, const char *b)
+{
+    if (!a || !b || !a[0] || !b[0])
+        return false;
+
+    char fa[SC_MAX_PATH], fb[SC_MAX_PATH];
+    DWORD na = GetFullPathNameA(a, sizeof(fa), fa, NULL);
+    DWORD nb = GetFullPathNameA(b, sizeof(fb), fb, NULL);
+    if (na == 0 || na >= sizeof(fa) || nb == 0 || nb >= sizeof(fb))
+        return _stricmp(a, b) == 0;
+    fa[sizeof(fa) - 1] = '\0';
+    fb[sizeof(fb) - 1] = '\0';
+    return _stricmp(fa, fb) == 0;
+}
+
+static bool finding_is_current_scanner(const Finding *f,
+                                       const char *bin, bool have_bin)
+{
+    if (!f)
+        return false;
+
+    DWORD self_pid = GetCurrentProcessId();
+    if (f->pid && f->pid == self_pid)
+        return true;
+
+    char self[SC_MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, self, sizeof(self));
+    if (n == 0 || n >= sizeof(self))
+        return false;
+    self[sizeof(self) - 1] = '\0';
+
+    if (have_bin && fullpath_equal_local(self, bin))
+        return true;
+    if (f->target[0] && fullpath_equal_local(self, f->target))
+        return true;
+    return false;
+}
+
 /* rule-glob match: exact, "FAMILY.*" prefix, or "*". case-insensitive. */
 static bool rule_glob_match(const char *glob, const char *rule_id)
 {
@@ -248,6 +286,9 @@ static const char *should_suppress(const ScanCtx *c, const Finding *f)
     char bin[SC_MAX_PATH];
     bool have_bin = finding_binary(c, f, bin, sizeof bin);
 
+    if (finding_is_current_scanner(f, have_bin ? bin : NULL, have_bin))
+        return "auto:self";
+
     /* lazy-computed, cached within this call */
     bool       sig_done = false; SignVerdict sig = SIGN_UNKNOWN;
     char       signer[SC_NAME_LEN] = {0};
@@ -368,10 +409,6 @@ void suppress_apply(ScanCtx *c)
     if (!c || !c->bus)
         return;
     FindingBus *b = c->bus;
-
-    /* If auto-fp is off and no suppress.txt entries, nothing to do. */
-    if ((!c->cfg || c->cfg->no_auto_fp) && g_supp.count == 0)
-        return;
 
     EnterCriticalSection(&b->lock);
 

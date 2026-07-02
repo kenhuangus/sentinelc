@@ -196,6 +196,10 @@ typedef struct {
     bool   imp_hook_api;        /* SetWindowsHookEx etc */
     bool   imp_keystate_api;    /* GetAsyncKeyState/GetKeyState */
     bool   imp_rawinput_api;    /* Register/GetRawInputData */
+    bool   imp_clipboard_api;   /* clipboard read/listen APIs */
+    bool   imp_screen_api;      /* screenshot / desktop capture APIs */
+    bool   imp_media_capture_api; /* mic/camera capture APIs */
+    bool   imp_cred_api;        /* Cred/Vault/DPAPI secret-read APIs */
     bool   imp_net_api;         /* ws2_32 connect/send/WSASocket */
     bool   imp_proc_inject_api; /* WriteProcessMemory/CreateRemoteThread */
     bool   imp_crypt_api;       /* crypt/ransomware-ish */
