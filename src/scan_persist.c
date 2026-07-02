@@ -1329,7 +1329,7 @@ static int wmi_query_emit(ScanCtx *c, IWbemServices *svc, const wchar_t *wql,
         const wchar_t *props[] = { L"Name", NULL };
         const wchar_t *cmds[]  = { L"CommandLineTemplate", L"ExecutablePath",
                                    L"ScriptText", L"ScriptFileName",
-                                   L"Query", NULL };
+                                   L"Consumer", L"Filter", L"Query", NULL };
 
         for (int i = 0; props[i]; i++) {
             VARIANT v; VariantInit(&v);
@@ -1354,6 +1354,18 @@ static int wmi_query_emit(ScanCtx *c, IWbemServices *svc, const wchar_t *wql,
         if (cmdbuf[0]) extract_target(cmdbuf, target, sizeof target);
         else { strncpy(target, namebuf, sizeof target - 1);
                target[sizeof target - 1] = '\0'; }
+
+        if (_stricmp(kind, "__FilterToConsumerBinding") == 0) {
+            if (!namebuf[0] && !cmdbuf[0]) {
+                obj->lpVtbl->Release(obj);
+                continue;
+            }
+            if (str_icontains(cmdbuf, "NTEventLogEventConsumer") &&
+                str_icontains(cmdbuf, "SCM Event Log Consumer")) {
+                obj->lpVtbl->Release(obj);
+                continue;
+            }
+        }
 
         if (!allowlist_match(target)) {
             bus_emit(c->bus, "PERSIST.WMI_SUB", SEV_HIGH, 85,
