@@ -20,3 +20,5 @@ baseline*
 .DS_Store
 Thumbs.db
 .gstack/
+.codegraph/
+.cursor/

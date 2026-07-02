@@ -340,6 +340,41 @@ static bool read_reg_sz(HKEY root, const char *subkey, const char *value,
     return true;
 }
 
+static const char *root_label(HKEY root)
+{
+    if (root == HKEY_LOCAL_MACHINE) return "HKLM";
+    if (root == HKEY_CURRENT_USER)  return "HKCU";
+    return "HK?";
+}
+
+static bool read_reg_dword(HKEY root, const char *subkey, const char *value,
+                           DWORD *out)
+{
+    if (out) *out = 0;
+    HKEY hk;
+    if (RegOpenKeyExA(root, subkey, 0, KEY_READ | KEY_QUERY_VALUE, &hk)
+        != ERROR_SUCCESS)
+        return false;
+    DWORD data = 0, dlen = sizeof data, type = 0;
+    LONG e = RegQueryValueExA(hk, value, NULL, &type, (BYTE *)&data, &dlen);
+    RegCloseKey(hk);
+    if (e != ERROR_SUCCESS || type != REG_DWORD || dlen != sizeof data)
+        return false;
+    if (out) *out = data;
+    return true;
+}
+
+static bool reg_key_exists(HKEY root, const char *subkey)
+{
+    HKEY hk;
+    LONG e = RegOpenKeyExA(root, subkey, 0, KEY_READ, &hk);
+    if (e == ERROR_SUCCESS) {
+        RegCloseKey(hk);
+        return true;
+    }
+    return false;
+}
+
 static void scan_winlogon(ScanCtx *c)
 {
     static const char *WL =
@@ -1683,6 +1718,444 @@ static void scan_svc_registry(ScanCtx *c)
 }
 
 /* ------------------------------------------------------------------ *
+ *  Security-control tamper and high-value policy persistence
+ * ------------------------------------------------------------------ *
+ *
+ * Modern intrusions frequently try to make the host easier to reinfect or
+ * harder to investigate: disable Defender/Firewall, create broad Defender
+ * exclusions, force browser extensions, or steer traffic through a proxy/PAC.
+ * These are not always malware by themselves, so every finding is ACT_REVIEW.
+ */
+
+static void emit_dword_when(ScanCtx *c, const char *rule, Severity sev,
+                            int conf, HKEY root, const char *subkey,
+                            const char *value, DWORD bad_value,
+                            const char *title, const char *why)
+{
+    DWORD got = 0;
+    if (!read_reg_dword(root, subkey, value, &got))
+        return;
+    if (got != bad_value)
+        return;
+
+    char target[SC_MAX_PATH];
+    snprintf(target, sizeof target, "%s\\%s\\%s",
+             root_label(root), subkey, value);
+    bus_emit(c->bus, rule, sev, conf, ACT_REVIEW, 0, target,
+             title, "%s %s\\%s %s=%lu", why, root_label(root), subkey,
+             value, (unsigned long)got);
+}
+
+static void scan_defender_policy_tamper(ScanCtx *c)
+{
+    static const char *WD =
+        "Software\\Policies\\Microsoft\\Windows Defender";
+    static const char *RTP =
+        "Software\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection";
+    static const char *SPYNET =
+        "Software\\Policies\\Microsoft\\Windows Defender\\Spynet";
+    static const char *FEATURES =
+        "Software\\Microsoft\\Windows Defender\\Features";
+
+    emit_dword_when(c, "TAMPER.DEFENDER_DISABLED", SEV_CRIT, 92,
+        HKEY_LOCAL_MACHINE, WD, "DisableAntiSpyware", 1,
+        "Microsoft Defender disabled by policy",
+        "Defender anti-spyware protection is explicitly disabled:");
+    emit_dword_when(c, "TAMPER.DEFENDER_DISABLED", SEV_CRIT, 92,
+        HKEY_LOCAL_MACHINE, WD, "DisableAntiVirus", 1,
+        "Microsoft Defender disabled by policy",
+        "Defender antivirus protection is explicitly disabled:");
+    emit_dword_when(c, "TAMPER.DEFENDER_DISABLED", SEV_HIGH, 86,
+        HKEY_LOCAL_MACHINE, RTP, "DisableRealtimeMonitoring", 1,
+        "Defender real-time monitoring disabled",
+        "Real-time monitoring is explicitly disabled:");
+    emit_dword_when(c, "TAMPER.DEFENDER_DISABLED", SEV_HIGH, 84,
+        HKEY_LOCAL_MACHINE, RTP, "DisableBehaviorMonitoring", 1,
+        "Defender behavior monitoring disabled",
+        "Behavior monitoring is explicitly disabled:");
+    emit_dword_when(c, "TAMPER.DEFENDER_DISABLED", SEV_HIGH, 84,
+        HKEY_LOCAL_MACHINE, RTP, "DisableOnAccessProtection", 1,
+        "Defender on-access protection disabled",
+        "On-access protection is explicitly disabled:");
+    emit_dword_when(c, "TAMPER.DEFENDER_DISABLED", SEV_HIGH, 84,
+        HKEY_LOCAL_MACHINE, RTP, "DisableIOAVProtection", 1,
+        "Defender downloaded-file scanning disabled",
+        "IOAV/downloaded-file scanning is explicitly disabled:");
+    emit_dword_when(c, "TAMPER.DEFENDER_DISABLED", SEV_HIGH, 82,
+        HKEY_LOCAL_MACHINE, RTP, "DisableScriptScanning", 1,
+        "Defender script scanning disabled",
+        "Script scanning is explicitly disabled:");
+    emit_dword_when(c, "TAMPER.DEFENDER_DISABLED", SEV_HIGH, 82,
+        HKEY_LOCAL_MACHINE, SPYNET, "DisableBlockAtFirstSeen", 1,
+        "Defender cloud block-at-first-sight disabled",
+        "Block-at-first-sight protection is explicitly disabled:");
+
+    /* TamperProtection is noisy across Windows builds, so only report a
+     * confidently bad explicit zero. Normal enabled values are non-zero. */
+    emit_dword_when(c, "TAMPER.DEFENDER_DISABLED", SEV_HIGH, 80,
+        HKEY_LOCAL_MACHINE, FEATURES, "TamperProtection", 0,
+        "Defender Tamper Protection disabled",
+        "Tamper Protection is explicitly disabled:");
+}
+
+static bool exclusion_value_suspicious(const char *name)
+{
+    if (!name || !name[0])
+        return false;
+    if (strcmp(name, "*") == 0 || strcmp(name, ".") == 0)
+        return true;
+    if (str_icontains(name, "\\users\\") ||
+        str_icontains(name, "\\appdata\\") ||
+        str_icontains(name, "\\programdata\\") ||
+        str_icontains(name, "\\temp\\") ||
+        str_icontains(name, "\\downloads\\") ||
+        str_icontains(name, "\\desktop\\") ||
+        str_icontains(name, "powershell.exe") ||
+        str_icontains(name, "pwsh.exe") ||
+        str_icontains(name, "cmd.exe") ||
+        str_icontains(name, "wscript.exe") ||
+        str_icontains(name, "cscript.exe") ||
+        str_icontains(name, "mshta.exe") ||
+        str_icontains(name, "rundll32.exe") ||
+        str_icontains(name, "regsvr32.exe"))
+        return true;
+    return false;
+}
+
+static void scan_defender_exclusion_key(ScanCtx *c, const char *leaf,
+                                        Severity base_sev)
+{
+    char subkey[SC_MAX_PATH];
+    snprintf(subkey, sizeof subkey,
+             "Software\\Microsoft\\Windows Defender\\Exclusions\\%s", leaf);
+
+    HKEY hk;
+    LONG rc = RegOpenKeyExA(HKEY_LOCAL_MACHINE, subkey, 0,
+                            KEY_READ | KEY_QUERY_VALUE, &hk);
+    if (rc != ERROR_SUCCESS) {
+        if (rc == ERROR_ACCESS_DENIED)
+            ctx_note_limit(c, "persist: access denied reading Defender exclusions");
+        return;
+    }
+
+    DWORD idx = 0;
+    for (;;) {
+        char  name[SC_MAX_PATH];
+        DWORD nlen = sizeof name;
+        BYTE  data[SC_MAX_CMDLINE];
+        DWORD dlen = sizeof data;
+        DWORD type = 0;
+        LONG e = RegEnumValueA(hk, idx, name, &nlen, NULL, &type, data, &dlen);
+        if (e == ERROR_NO_MORE_ITEMS) break;
+        idx++;
+        if (e != ERROR_SUCCESS) continue;
+        name[sizeof name - 1] = '\0';
+
+        bool broad = exclusion_value_suspicious(name);
+        if (!broad && (type == REG_SZ || type == REG_EXPAND_SZ) && dlen > 0) {
+            data[(dlen < sizeof data) ? dlen : sizeof data - 1] = '\0';
+            broad = exclusion_value_suspicious((const char *)data);
+        }
+        if (!broad && allowlist_match(name))
+            continue;
+
+        char target[SC_MAX_PATH];
+        snprintf(target, sizeof target, "%s:%s", leaf, name);
+        bus_emit(c->bus, "TAMPER.DEFENDER_EXCLUSION",
+                 broad ? SEV_HIGH : base_sev, broad ? 82 : 55,
+                 ACT_REVIEW, 0, target,
+                 broad ? "Suspicious Microsoft Defender exclusion"
+                       : "Microsoft Defender exclusion present",
+                 "HKLM\\%s value \"%s\"%s", subkey, name,
+                 broad ? " covers a broad/user-writable/tooling location" : "");
+    }
+    RegCloseKey(hk);
+}
+
+static void scan_defender_exclusions(ScanCtx *c)
+{
+    scan_defender_exclusion_key(c, "Paths", SEV_MED);
+    scan_defender_exclusion_key(c, "Processes", SEV_MED);
+    scan_defender_exclusion_key(c, "Extensions", SEV_LOW);
+}
+
+static void scan_firewall_tamper(ScanCtx *c)
+{
+    static const char *BASE =
+        "SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy";
+    static const char *profiles[] = {
+        "DomainProfile", "StandardProfile", "PublicProfile", NULL
+    };
+    for (int i = 0; profiles[i]; i++) {
+        char sub[SC_MAX_PATH];
+        snprintf(sub, sizeof sub, "%s\\%s", BASE, profiles[i]);
+        emit_dword_when(c, "TAMPER.FIREWALL_DISABLED", SEV_HIGH, 78,
+            HKEY_LOCAL_MACHINE, sub, "EnableFirewall", 0,
+            "Windows Firewall profile disabled",
+            "Firewall profile is explicitly disabled:");
+    }
+}
+
+static void scan_security_service_tamper(ScanCtx *c)
+{
+    static const struct {
+        const char *svc;
+        const char *title;
+        Severity sev;
+    } svcs[] = {
+        { "WinDefend", "Microsoft Defender Antivirus service disabled", SEV_CRIT },
+        { "WdNisSvc",  "Defender Network Inspection service disabled", SEV_HIGH },
+        { "Sense",     "Microsoft Defender for Endpoint sensor disabled", SEV_HIGH },
+        { "SecurityHealthService", "Windows Security Health service disabled", SEV_MED },
+        { NULL, NULL, SEV_INFO }
+    };
+
+    for (int i = 0; svcs[i].svc; i++) {
+        char sub[SC_MAX_PATH];
+        snprintf(sub, sizeof sub, "SYSTEM\\CurrentControlSet\\Services\\%s",
+                 svcs[i].svc);
+        DWORD start = 0;
+        if (!read_reg_dword(HKEY_LOCAL_MACHINE, sub, "Start", &start))
+            continue;
+        if (start != 4)
+            continue;
+        char target[SC_MAX_PATH];
+        snprintf(target, sizeof target, "HKLM\\%s", sub);
+        bus_emit(c->bus, "TAMPER.SECURITY_SERVICE", svcs[i].sev, 84,
+                 ACT_REVIEW, 0, target, svcs[i].title,
+                 "HKLM\\%s Start=disabled (4); malware/BYOVD commonly "
+                 "disables security services before staging payloads",
+                 sub);
+    }
+}
+
+static void scan_security_tamper(ScanCtx *c)
+{
+    scan_defender_policy_tamper(c);
+    scan_defender_exclusions(c);
+    scan_firewall_tamper(c);
+    scan_security_service_tamper(c);
+}
+
+static bool proxy_value_suspicious(const char *v)
+{
+    if (!v || !v[0])
+        return false;
+    if (str_icontains(v, "127.0.0.1") ||
+        str_icontains(v, "localhost") ||
+        str_icontains(v, "pac") ||
+        str_icontains(v, "http://") ||
+        str_icontains(v, "https://") ||
+        str_icontains(v, ".onion") ||
+        str_icontains(v, "\\appdata\\") ||
+        str_icontains(v, "\\temp\\"))
+        return true;
+    return false;
+}
+
+static void scan_proxy_policy_one(ScanCtx *c, HKEY root)
+{
+    static const char *INET =
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+    DWORD enabled = 0;
+    char proxy[SC_MAX_CMDLINE] = "";
+    char pac[SC_MAX_CMDLINE] = "";
+    bool have_proxy = read_reg_sz(root, INET, "ProxyServer", proxy, sizeof proxy);
+    bool have_pac = read_reg_sz(root, INET, "AutoConfigURL", pac, sizeof pac);
+
+    if (read_reg_dword(root, INET, "ProxyEnable", &enabled) &&
+        enabled == 1 && have_proxy && proxy[0] &&
+        !allowlist_match(proxy)) {
+        bool sus = proxy_value_suspicious(proxy);
+        bus_emit(c->bus, "PERSIST.PROXY", sus ? SEV_HIGH : SEV_MED,
+                 sus ? 78 : 55, ACT_REVIEW, 0, proxy,
+                 sus ? "Suspicious system proxy configured"
+                     : "System proxy configured",
+                 "%s\\%s ProxyEnable=1 ProxyServer=\"%s\"",
+                 root_label(root), INET, proxy);
+    }
+    if (have_pac && pac[0] && !allowlist_match(pac)) {
+        bool sus = proxy_value_suspicious(pac);
+        bus_emit(c->bus, "PERSIST.PROXY", sus ? SEV_HIGH : SEV_MED,
+                 sus ? 80 : 60, ACT_REVIEW, 0, pac,
+                 sus ? "Suspicious PAC/AutoConfig proxy configured"
+                     : "PAC/AutoConfig proxy configured",
+                 "%s\\%s AutoConfigURL=\"%s\"",
+                 root_label(root), INET, pac);
+    }
+}
+
+static void scan_proxy_policy(ScanCtx *c)
+{
+    scan_proxy_policy_one(c, HKEY_CURRENT_USER);
+    scan_proxy_policy_one(c, HKEY_LOCAL_MACHINE);
+}
+
+static void scan_browser_forced_extensions_one(ScanCtx *c, HKEY root,
+                                               const char *vendor,
+                                               const char *browser)
+{
+    char subkey[SC_MAX_PATH];
+    snprintf(subkey, sizeof subkey,
+             "Software\\Policies\\%s\\%s\\ExtensionInstallForcelist",
+             vendor, browser);
+
+    HKEY hk;
+    LONG rc = RegOpenKeyExA(root, subkey, 0,
+                            KEY_READ | KEY_QUERY_VALUE, &hk);
+    if (rc != ERROR_SUCCESS)
+        return;
+
+    DWORD idx = 0;
+    for (;;) {
+        char  name[SC_NAME_LEN];
+        DWORD nlen = sizeof name;
+        BYTE  data[SC_MAX_CMDLINE];
+        DWORD dlen = sizeof data;
+        DWORD type = 0;
+        LONG e = RegEnumValueA(hk, idx, name, &nlen, NULL, &type, data, &dlen);
+        if (e == ERROR_NO_MORE_ITEMS) break;
+        idx++;
+        if (e != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ))
+            continue;
+        if (dlen == 0) continue;
+        data[(dlen < sizeof data) ? dlen : sizeof data - 1] = '\0';
+        data[sizeof data - 1] = '\0';
+        char raw[SC_MAX_CMDLINE];
+        if (type == REG_EXPAND_SZ) expand_env((const char *)data, raw, sizeof raw);
+        else { strncpy(raw, (const char *)data, sizeof raw - 1);
+               raw[sizeof raw - 1] = '\0'; }
+        trim_ws(raw);
+        if (!raw[0] || allowlist_match(raw))
+            continue;
+
+        bool external = str_icontains(raw, "http://") ||
+                        str_icontains(raw, "https://") ||
+                        str_icontains(raw, ";");
+        bus_emit(c->bus, "PERSIST.BROWSER_EXTENSION",
+                 external ? SEV_HIGH : SEV_MED, external ? 78 : 65,
+                 ACT_REVIEW, 0, raw,
+                 "Browser extension force-installed by policy",
+                 "%s\\%s value \"%s\" = \"%s\"",
+                 root_label(root), subkey, name, raw);
+    }
+    RegCloseKey(hk);
+}
+
+static void scan_browser_forced_extensions(ScanCtx *c)
+{
+    scan_browser_forced_extensions_one(c, HKEY_LOCAL_MACHINE, "Google", "Chrome");
+    scan_browser_forced_extensions_one(c, HKEY_CURRENT_USER,  "Google", "Chrome");
+    scan_browser_forced_extensions_one(c, HKEY_LOCAL_MACHINE, "Microsoft", "Edge");
+    scan_browser_forced_extensions_one(c, HKEY_CURRENT_USER,  "Microsoft", "Edge");
+}
+
+static bool app_path_name_sensitive(const char *sub)
+{
+    static const char *names[] = {
+        "cmd.exe", "powershell.exe", "pwsh.exe", "wscript.exe",
+        "cscript.exe", "mshta.exe", "rundll32.exe", "regsvr32.exe",
+        "regedit.exe", "taskmgr.exe", "mmc.exe", "control.exe",
+        "msiexec.exe", "schtasks.exe", "sc.exe", "net.exe", NULL
+    };
+    char leaf[SC_NAME_LEN];
+    base_name(sub, leaf, sizeof leaf);
+    if (!leaf[0]) {
+        strncpy(leaf, sub ? sub : "", sizeof leaf - 1);
+        leaf[sizeof leaf - 1] = '\0';
+    }
+    str_lower(leaf);
+    for (int i = 0; names[i]; i++)
+        if (strcmp(leaf, names[i]) == 0)
+            return true;
+    return false;
+}
+
+static void scan_app_paths_hijack_one(ScanCtx *c, HKEY root)
+{
+    static const char *APP_PATHS =
+        "Software\\Microsoft\\Windows\\CurrentVersion\\App Paths";
+    HKEY hk;
+    LONG rc = RegOpenKeyExA(root, APP_PATHS, 0,
+                            KEY_READ | KEY_ENUMERATE_SUB_KEYS, &hk);
+    if (rc != ERROR_SUCCESS)
+        return;
+
+    DWORD idx = 0;
+    for (; idx < 4096; ) {
+        char  sub[SC_NAME_LEN];
+        DWORD slen = sizeof sub;
+        LONG e = RegEnumKeyExA(hk, idx, sub, &slen, NULL, NULL, NULL, NULL);
+        if (e == ERROR_NO_MORE_ITEMS) break;
+        idx++;
+        if (e != ERROR_SUCCESS) continue;
+
+        char full[SC_MAX_PATH];
+        snprintf(full, sizeof full, "%s\\%s", APP_PATHS, sub);
+        char val[SC_MAX_CMDLINE];
+        if (!read_reg_sz(root, full, NULL, val, sizeof val))
+            continue;
+        trim_ws(val);
+        if (!val[0]) continue;
+
+        char target[SC_MAX_PATH];
+        extract_target(val, target, sizeof target);
+        if (!target[0]) {
+            strncpy(target, val, sizeof target - 1);
+            target[sizeof target - 1] = '\0';
+        }
+        if (allowlist_match(target) || allowlist_match(sub))
+            continue;
+
+        if (str_icontains(target, "\\windowsapps\\"))
+            continue; /* normal Store/App Execution Alias population */
+
+        SignVerdict v = SIGN_UNKNOWN;
+        if (GetFileAttributesA(target) != INVALID_FILE_ATTRIBUTES)
+            v = sign_verify(target, NULL, 0);
+
+        PathLoc loc = path_classify(target);
+        bool user_writable = path_is_user_writable(target);
+        bool unsigned_bad = (v == SIGN_UNSIGNED || v == SIGN_INVALID);
+        bool tempish = (loc == PATHLOC_TEMP || loc == PATHLOC_RECYCLE);
+        bool sensitive = app_path_name_sensitive(sub);
+
+        if (sensitive && v == SIGN_SIGNED_MS &&
+            (loc == PATHLOC_SYSTEM || loc == PATHLOC_WINDOWS))
+            continue;
+
+        if (!sensitive && !(unsigned_bad && user_writable) && !tempish)
+            continue;
+
+        const char *why = sensitive ? "sensitive command name" :
+                          tempish ? "temp/recycle target" :
+                          (v == SIGN_INVALID ? "invalid signature in user-writable path" :
+                                               "unsigned in user-writable path");
+
+        bus_emit(c->bus, "PERSIST.APP_PATHS",
+                 (sensitive || tempish) ? SEV_HIGH : SEV_MED,
+                 (sensitive || tempish) ? 78 : 65,
+                 ACT_REVIEW, 0, target,
+                 root == HKEY_CURRENT_USER ?
+                    "Per-user App Paths execution hijack" :
+                    "Suspicious App Paths target",
+                 "%s\\%s default=\"%s\" -> %s [%s; %s%s%s]",
+                 root_label(root), full, val, target, why, sign_name(v),
+                 user_writable ? "; user-writable" : "",
+                 tempish ? "; temp-like" : "");
+    }
+    RegCloseKey(hk);
+}
+
+static void scan_app_paths_hijack(ScanCtx *c)
+{
+    if (reg_key_exists(HKEY_CURRENT_USER,
+            "Software\\Microsoft\\Windows\\CurrentVersion\\App Paths"))
+        scan_app_paths_hijack_one(c, HKEY_CURRENT_USER);
+    scan_app_paths_hijack_one(c, HKEY_LOCAL_MACHINE);
+}
+
+/* ------------------------------------------------------------------ *
  *  entry point
  * ------------------------------------------------------------------ */
 
@@ -1722,6 +2195,10 @@ void scan_persist(ScanCtx *c)
     scan_ifeo(c);
     scan_com_hijack(c);
     scan_svc_registry(c);
+    scan_security_tamper(c);
+    scan_proxy_policy(c);
+    scan_browser_forced_extensions(c);
+    scan_app_paths_hijack(c);
 
     /* Filesystem-based checks. */
     scan_startup_folders(c, com_ok);
