@@ -12,13 +12,13 @@
   What it does (elevated):
     1. Copies sentinelc.exe + rules\ + agent scripts to $InstallDir.
     2. Locks the install dir ACL (SYSTEM/Admins full, Users read-only).
-    3. Writes config.json with the console URL and a DPAPI-protected token.
+    3. Writes config.json with the console URL and a DPAPI-protected host ingest token.
     4. Registers task "\SentinelC\FullScan" (SYSTEM, highest) on a daily
        schedule, at startup, and runnable on demand.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File install.ps1 `
-    -ConsoleUrl https://console.example.com -Token <token>
+    -ConsoleUrl https://console.example.com -Token <this-host-ingest-token>
 
 .EXAMPLE
   # See what it would do without changing anything:

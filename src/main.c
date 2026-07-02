@@ -47,7 +47,7 @@ static void print_help(const char *argv0)
         "\n"
         "Scan modes:\n"
         "  --quick            Fast subset: process, service, persist, network (default)\n"
-        "  --full             All scanners (adds keylog, rootkit)\n"
+        "  --full             All live scanners (adds keylog, rootkit, creds, memory, evasion)\n"
         "  --deep             Hash files / heavier checks\n"
         "  --watch N          Network beacon sampling window of N seconds\n"
         "  --scan-path PATH   Targeted file/directory scan (skips live scanners)\n"

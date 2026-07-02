@@ -1,189 +1,167 @@
-# PRD — SentinelC: Fast Windows Threat Triage Scanner
+# PRD - SentinelC: Fast Windows Threat Triage Scanner
 
-## 1. Summary
+## Summary
 
 SentinelC is a fast, native C command-line tool for Windows that scans a live
-system for signs of malware, rootkits, keyloggers, RCE backdoors, and
-command-and-control (C2) implants, surfaces suspicious services and processes,
-and can terminate/disable them on operator confirmation.
+system for signs of malware, spyware, keyloggers, rootkit-style hiding,
+credential access, persistence, RCE backdoors, C2 behavior, memory injection,
+and Defender/security tamper. It can also perform gated response actions after
+operator confirmation.
 
-It is a **host triage and detection** tool, not a replacement for a full EDR.
-It is designed to run in seconds, be fully transparent (every detection rule is
-explainable), and require zero cloud dependency.
+It is a host triage and response tool, not a replacement for a full EDR or
+Defender. Its value is speed, transparency, local control, and explainable
+evidence.
 
-## 2. Problem statement
+## Goals
 
-Commercial AV/EDR products are opaque black boxes, often heavy, and can miss
-fileless or living-off-the-land threats. Incident responders and power users
-need a fast, scriptable, locally-controlled tool that:
+- Run on-demand host triage quickly without a cloud dependency.
+- Cite rule id, severity, confidence, target, and evidence for every finding.
+- Detect process, service, persistence, network, keylogger/spyware, rootkit-style
+  cross-view, credential-access, memory-injection, evasion, file IOC, FIM, and
+  offline-like VSS signals.
+- Stay read-only by default.
+- Gate destructive actions with explicit flags, confirmation, critical-process
+  guards, and audit logging.
 
-- Enumerates everything that runs, persists, listens, or hooks input.
-- Flags anomalies using explainable heuristics (not a hidden ML model).
-- Detects rootkit-style hiding via cross-view comparison.
-- Lets the operator kill/disable confirmed threats immediately.
+## Non-Goals
 
-## 3. Goals & non-goals
+- No always-on real-time AV in this repository.
+- No cloud reputation or signature-corpus race against Defender/CrowdStrike.
+- No automatic kernel driver loading.
+- No registry cleaner or generic "remove unused entries" feature.
+- No guarantee against advanced kernel DKOM rootkits from user mode.
 
-### Goals
-- **Speed**: full quick scan (processes, services, persistence, network) in
-  under ~10 seconds on a typical workstation.
-- **Transparency**: every finding cites the exact rule and evidence that
-  triggered it, with a severity and confidence score.
-- **Coverage of the named threat classes**:
-  - Generic malware (suspicious PEs, packed/high-entropy, unsigned in system
-    paths, masquerading binaries).
-  - Rootkits (hidden processes/files/registry via cross-view diff; SSDT/driver
-    anomalies where accessible).
-  - Keyloggers (low-level keyboard/mouse hooks, raw input device registration,
-    suspicious GetAsyncKeyState pollers).
-  - RCE / reverse shells / C2 (anomalous outbound connections, beaconing
-    patterns, processes spawning shells, suspicious parent/child chains).
-  - Persistence (run keys, services, scheduled tasks, WMI subscriptions,
-    startup folders, image hijacks, AppInit/IFEO).
-- **Response**: terminate process, suspend process, stop + disable service,
-  quarantine file (move + strip ACLs), with confirmation gates.
-- **Safety**: dry-run by default; nothing is killed or modified without an
-  explicit flag or interactive confirmation; full audit log.
-
-### Non-goals
-- Not a real-time always-on AV (no kernel minifilter in v1).
-- Not a signature/cloud-reputation race against Defender/CrowdStrike.
-- Not a remediation/repair tool (no registry cleaning, no rollback).
-- No automatic kernel driver loading in v1 (user-mode only; documented
-  limitations on what user-mode rootkit detection can see).
-
-## 4. Honest positioning vs. existing AV
+## Positioning
 
 | Dimension | SentinelC | Commercial AV/EDR |
 |---|---|---|
-| Speed of a triage scan | **Wins** (seconds, no cloud) | Slower, background scans |
-| Transparency / tunability | **Wins** (open rules) | Opaque |
-| Fileless / LOLBin heuristics | Competitive | Varies |
-| Signature breadth | Loses | Wins (huge corpora + cloud) |
-| Kernel-level rootkit visibility | Loses in v1 (user-mode) | Wins (kernel driver) |
-| Real-time blocking | Loses (on-demand only) | Wins |
+| On-demand triage speed | Strong | Varies |
+| Transparency | Strong, source/rules are readable | Usually opaque |
+| Local-only operation | Strong | Often cloud-assisted |
+| Signature breadth | Limited | Strong |
+| Kernel-level visibility | Limited in this repo | Strong when an agent/driver exists |
+| Real-time blocking | Not the current product | Strong |
 
-**Conclusion:** SentinelC's value is *fast, explainable, locally-controlled
-triage and response*, complementing — not replacing — Defender. The "better
-than other antivirus" framing is scoped to **speed and transparency on
-on-demand host triage**, not total detection rate.
+SentinelC complements Defender. It should not be marketed as a total AV/EDR
+replacement.
 
-## 5. Users & use cases
+## Functional Requirements
 
-- **Incident responder**: lands on a possibly-compromised box, runs a 10s scan,
-  gets a ranked list of suspicious artifacts with evidence, kills the obvious
-  implant.
-- **Power user / sysadmin**: periodic sweep for persistence and rogue services.
-- **Blue-team / detection engineer**: tunes rules, exports JSON for a SIEM.
+### FR-1 Process Scan
 
-## 6. Functional requirements
+- Enumerate PID, PPID, image path, command line, user, integrity level, signer
+  state, parent chain, and create time where accessible.
+- Flag masquerading, temp/user-writable execution, unsigned/invalid system-path
+  images, unverifiable signatures in sensitive locations, suspicious parent
+  chains, private RWX/unbacked executable memory, packed images, PPID spoofing,
+  LOLBin arguments, and encoded PowerShell.
 
-### FR-1 Process scan
-- Enumerate all processes (PID, PPID, image path, command line, user, signing
-  status, integrity level, parent chain).
-- Flag: unsigned binary in `System32`/`Program Files`; image path mismatch with
-  known system process name (e.g. `svch0st.exe`, `svchost.exe` outside System32);
-  process running from temp/`AppData`/recycle bin; high-entropy/packed image;
-  injected/RWX memory regions; suspicious parent (e.g. `winword.exe` →
-  `cmd.exe` → `powershell.exe`).
+### FR-2 Service Scan
 
-### FR-2 Service scan
-- Enumerate all services (name, display name, binary path, start type, state,
-  account, signing status).
-- Flag: unsigned service binary; binary in user-writable path; unquoted service
-  path with spaces; recently created service; service whose binary is also
-  flagged by the process/file rules; svchost service with a suspicious DLL.
-- **Response**: stop + set start type Disabled, with confirmation.
+- Enumerate services and drivers, normalize service binary paths, inspect signer
+  and path state, and cross-reference running PIDs.
+- Flag user-writable service paths, unsigned/invalid binaries, unverifiable
+  signatures outside inbox paths, unquoted paths, and suspicious `svchost`
+  ServiceDll values.
+- Response: stop and disable service with confirmation.
 
-### FR-3 Rootkit detection (user-mode cross-view)
-- Compare process lists from multiple APIs (`CreateToolhelp32Snapshot`,
-  `EnumProcesses`, `NtQuerySystemInformation`, WTS) → hidden-process diff.
-- Compare directory listings (`FindFirstFile` vs `NtQueryDirectoryFile`) for
-  hidden files.
-- Compare registry enumeration paths for hidden keys.
-- Enumerate loaded kernel drivers (`EnumDeviceDrivers`) and flag unsigned /
-  non-Microsoft drivers in suspicious paths.
-- Document clearly: a kernel rootkit can defeat user-mode cross-view; v1 detects
-  the common user-mode and naive kernel hooks, not advanced DKOM.
+### FR-3 Rootkit-Style Cross-View
 
-### FR-4 Keylogger detection
-- Detect global low-level hooks where determinable; enumerate windows/hooks.
-- Flag processes registered for Raw Input keyboard devices.
-- Flag processes with tight `GetAsyncKeyState`/`GetKeyState` polling patterns
-  (heuristic, via imported APIs + behavior where observable).
-- Flag DLLs loaded into many processes that import keyboard-hook APIs.
+- Compare process lists from multiple APIs.
+- Compare file listings in sensitive paths through Win32 and native directory
+  enumeration.
+- Enumerate loaded drivers and flag suspicious unsigned/non-Microsoft drivers.
+- Clearly report that advanced kernel rootkits can defeat user-mode checks.
 
-### FR-5 Network / C2 / RCE detection
-- Enumerate TCP/UDP endpoints with owning PID (`GetExtendedTcpTable`).
-- Flag: listening ports bound by unsigned/temp-path processes; outbound
-  connections to non-standard ports by office/script processes; beaconing
-  (requires short sampling window — optional `--watch` mode);
-  process holding a socket *and* a pipe to `cmd.exe`/`powershell.exe`
-  (reverse-shell shape).
-- Resolve remote IPs; flag connections to raw IPs with no DNS, or to known-bad
-  ranges from an optional local IOC list.
+### FR-4 Keylogger And Spyware Signals
 
-### FR-6 Persistence enumeration
-- Run/RunOnce keys (HKLM/HKCU, Wow6432Node).
-- Services (cross-ref FR-2).
-- Scheduled tasks (parse Task Scheduler).
-- Startup folders.
-- WMI event subscriptions (`__EventFilter`/`CommandLineEventConsumer`).
-- Image File Execution Options (debugger hijack), AppInit_DLLs, Winlogon
-  Shell/Userinit, COM hijacks (common CLSIDs).
+- Detect low-level hook owners where determinable.
+- Flag raw-input keyboard registrations.
+- Flag key-state polling/import combinations.
+- Flag multi-capture capability combinations: clipboard, screen, media capture,
+  credential APIs, and network capability.
 
-### FR-7 File scan (targeted)
-- On-demand scan of a path/directory: entropy, PE anomalies, Authenticode
-  verification, optional YARA-style local rule matching, optional hash check
-  against a local IOC hash list.
+### FR-5 Network, C2, And RCE Signals
 
-### FR-8 Reporting
-- Human-readable colored console output, ranked by severity × confidence.
-- `--json` machine-readable output for SIEM ingestion.
-- Per-finding: rule id, evidence, severity, confidence, recommended action.
+- Enumerate TCP/UDP endpoints with owning PID.
+- Flag suspicious listeners, raw-IP outbound connections, known-bad IOC IPs,
+  shell-socket process shapes, and optional beaconing through `--watch N`.
 
-### FR-9 Response actions (gated)
-- `--kill <pid>`, `--suspend <pid>`, `--disable-service <name>`,
-  `--quarantine <path>`.
-- Interactive mode: present findings, prompt per action.
-- All actions logged to an append-only audit file with timestamps.
+### FR-6 Persistence And Tamper
 
-## 7. Non-functional requirements
+- Inspect Run/RunOnce, Winlogon, AppInit, AppCertDLLs, IFEO,
+  SilentProcessExit, startup folders, scheduled tasks, WMI subscriptions, COM
+  hijacks, service registry view, Defender/security-service tamper, proxy
+  settings, browser extensions, and App Paths.
 
-- **Performance**: quick scan < 10s; full scan < 60s on SSD workstation.
-- **Footprint**: single static-linked .exe, < 2 MB, no installer, no .NET.
-- **Privilege**: runs with current token; auto-detects when elevation is needed
-  and reports what it could not inspect without admin. Many checks require
-  Administrator; `SeDebugPrivilege` requested when available.
-- **Safety**: read-only by default; no destructive action without explicit flag
-  or confirmation; never kill PID 0/4/critical system PIDs without `--force`.
-- **Portability**: Windows 10/11 x64; build with MSVC and MinGW-w64.
-- **No false sense of security**: output states scan limitations explicitly.
+### FR-7 Targeted File Scan
 
-## 8. Success metrics
+- On-demand scan of a file or directory for PE/signing/entropy anomalies,
+  packed files, suspicious import combinations, hash IOCs, YARA-lite rules, and
+  full-file string IOC streaming.
 
-- Detects a planted EICAR file, a Run-key persistence, a netcat reverse shell,
-  a SetWindowsHookEx keylogger, and a userland process-hiding hook in a test
-  VM — all flagged with correct evidence.
-- Quick scan completes in target time.
-- Zero destructive action taken in dry-run mode (verified by audit log).
-- False-positive rate on a clean reference image: tracked and minimized;
-  tunable via allowlist.
+### FR-8 Credential, Memory, And Evasion Scan
 
-## 9. Risks & mitigations
+- Flag suspicious LSASS and sensitive credential-file handles.
+- Inspect private executable memory for shellcode and reflective PE markers.
+- Compare loaded module headers with on-disk files for hollowing evidence.
+- Compare AMSI/ETW prologues in memory with clean on-disk bytes.
 
-- **False positives killing legit services** → confirmation gates, allowlist,
-  dry-run default, never-kill list of critical PIDs.
-- **Kernel rootkit evasion** → documented limitation; v2 optional signed driver.
-- **Being flagged by Defender itself** (it enumerates/kills processes) → ship
-  unsigned dev build with documented Defender exclusion for testing; plan code
-  signing for release.
-- **Privilege misuse** → tool is dual-use; document authorized-use scope; audit
-  log of all actions.
+### FR-9 Integrity And Offline-Like Modes
 
-## 10. Out of scope for v1 (future)
-- Kernel minifilter driver for real-time + true kernel cross-view.
-- Memory dumping / full memory forensics.
-- Automated remediation/repair and rollback.
-- Cloud reputation lookups.
-- YARA full engine (v1 uses a small built-in rule subset).
+- `--baseline` and `--integrity` build/check a Merkle baseline over
+  execution-relevant files, stream-hash file contents, and authenticate baselines
+  with HMAC-SHA256 plus a DPAPI-wrapped key.
+- `--offline-like` creates a VSS snapshot, scans selected snapshot paths,
+  inspects offline registry hives, checks boot drivers and Defender exclusions,
+  and probes raw volume metadata where accessible.
+
+### FR-10 Reporting And Response
+
+- Console report sorted by severity/confidence.
+- JSON report for automation and fleet ingestion.
+- Per-finding rule id, severity, confidence, title, target, PID, evidence, and
+  recommended action.
+- Gated actions: kill, suspend, disable service, quarantine, or interactive
+  review. All actions are audited.
+
+## Non-Functional Requirements
+
+- Windows 10/11 x64.
+- Native Windows binary built with MinGW-w64 through `build.ps1`, `build.sh`, or
+  `Makefile`.
+- Current build output is about 1.1 MB.
+- No cloud dependency.
+- Graceful degradation when not elevated, with limitations in output.
+- Read-only by default.
+- No destructive action without explicit operator request.
+
+## Safety Requirements
+
+- Critical PIDs and critical system images are refused unless
+  `--force-critical`.
+- Process kill/suspend validates and acts through one handle to avoid PID reuse.
+- Quarantine rejects reparse points/directories and uses locked SYSTEM/Admin-only
+  storage.
+- Remote Fleet Console uploads must use HTTPS, except loopback HTTP for local
+  testing.
+- Built-in false-positive suppression must not trust arbitrary signer subjects;
+  only Microsoft-signed noisy rules are auto-suppressed.
+
+## Risks And Mitigations
+
+- False positives: confirmation gates, suppress/allowlist support, conservative
+  auto-suppression, and evidence-first reporting.
+- Kernel rootkit evasion: documented limitation and future signed-driver
+  roadmap.
+- Unsigned binary reputation: production release should use code signing.
+- Dual-use risk: authorized-use documentation, dry-run defaults, and audit logs.
+
+## Future Work
+
+- Canonical path classification cleanup.
+- Robust scheduled-task XML parsing.
+- Persistent signature/PE caches.
+- Parallel FIM hashing.
+- Full YARA/libyara or a larger documented subset.
+- Signed kernel driver for kernel-vantage visibility and real-time blocking.

@@ -1,10 +1,10 @@
 # I Built My Own Antivirus in C, and It Caught a Real Infostealer
 
-## What a transparent, 970 KB Windows scanner taught me about trust, false positives, and the malware already on my machine
+## What a transparent, about-1 MB Windows scanner taught me about trust, false positives, and the malware already on my machine
 
 I stopped trusting my antivirus the day I realized I had no idea what it was doing. It scanned, it flagged, it sat in the tray with a green checkmark. When it stayed silent, was that because my machine was clean, or because the threat was something it had never seen? I could not tell. A green checkmark is a promise with no proof.
 
-So I built my own. SentinelC is a single native-C executable for Windows. It is under a megabyte, it has no installer, no cloud, no kernel driver, and it finishes a full system scan in under two minutes. Every alert it raises cites the exact rule and the exact evidence that triggered it. You can read every detection in the source. And when I pointed it at my own laptop, running as administrator, it found an active infostealer's persistence sitting in a scheduled task that my real antivirus had walked past.
+So I built my own. SentinelC is a single native-C executable for Windows. The current build is about 1.1 MB, can run without installation, has no cloud dependency or kernel driver, and finishes a full system scan in under two minutes on my test machine. Every alert it raises cites the exact rule and the exact evidence that triggered it. You can read every detection in the source. And when I pointed it at my own laptop, running as administrator, it found an active infostealer's persistence sitting in a scheduled task that my real antivirus had walked past.
 
 This is the story of how it works, what it gets right, where it is honestly worse than a commercial product, and the live incident it surfaced. I will show you the architecture, the detection tricks, the false-positive war that nearly sank it, and the moment a fake "Microsoft Edge update" task turned out to be a malware loader.
 
@@ -31,13 +31,13 @@ Here is the honest positioning, the part most security tools bury. SentinelC wil
 
 That framing shaped every decision. I did not try to build a real-time blocker, because a user-mode tool cannot do that well and I would be lying to you about the protection. I built an on-demand scanner that you run when you want answers, that tells you what it could not inspect, and that never pretends a clean result means you are safe. The output ends with a "Limitations" section every single time, listing what it skipped and why. A tool that hides its blind spots is worse than no tool, because it manufactures false confidence.
 
-The whole thing is one `.exe` you run from an administrator command prompt. No agent humming in the background, no service, no auto-update phoning home. You point it at your machine, it reports, and it exits. If that sounds primitive next to a modern endpoint product, it is. It is also auditable in an afternoon, which no modern endpoint product is.
+The core scanner is one `.exe` you can run from an administrator command prompt. There is also an optional installer and Fleet Console now, but the scanner itself still works as a local, inspectable, on-demand tool. You point it at your machine, it reports, and it exits. If that sounds primitive next to a modern endpoint product, it is. It is also auditable in an afternoon, which no modern endpoint product is.
 
 ## How it's wired
 
 The shape of the code is simple on purpose. There is a small core (the CLI, a thread pool, a shared finding bus, and a reporter), a set of independent scanner modules that each look for one family of badness, and a responder that can act on what the scanners find. Nothing is clever about the topology. The cleverness lives in the individual detections and in one correlation pass at the end.
 
-![SentinelC architecture: main builds the context, the engine fans out six scanners, findings flow into a locked bus, a correlation pass runs, then the reporter and responder consume the results](diagrams/01-architecture.png)
+![SentinelC architecture: main builds the context, the engine fans out the live scanners, findings flow into a locked bus, a correlation pass runs, then the reporter and responder consume the results](diagrams/01-architecture.png)
 
 Every scanner is read-only and writes nothing to the system. It only emits findings into a shared bus. That single rule, scanners produce findings and never act, is what makes the whole thing safe to run and easy to reason about. A finding is a flat record: a rule id, a severity, a confidence score, the evidence string, the target path or PID, and a recommended action.
 
@@ -203,7 +203,7 @@ Two lessons, and the second one cost me three cleanups to learn. First, my comme
 
 ## Building it with a swarm of agents that audit each other
 
-One more thing, because it changed how I think about writing this kind of code. I did not write SentinelC's nineteen modules one after another by hand. I wrote a locked header that defined every contract, the finding struct, the bus API, the scanner signatures, and then I dispatched eight AI agents in parallel, each owning a disjoint set of files, all compiling against the same fixed interface. The header was the coordination mechanism. Because the contracts could not move, the modules could not collide.
+One more thing, because it changed how I think about writing this kind of code. I did not write SentinelC one file after another by hand. I wrote a locked header that defined every contract, the finding struct, the bus API, the scanner signatures, and then I dispatched eight AI agents in parallel, each owning a disjoint set of files, all compiling against the same fixed interface. The header was the coordination mechanism. Because the contracts could not move, the modules could not collide.
 
 That got the thing built fast. It did not make it correct. So I ran a second wave of agents whose only job was to attack the first wave's code, one agent per group of files, each told to assume the input is hostile and find the memory-safety bug. They found eleven. A 32-bit integer overflow in the PE parser that a crafted executable could use to read out of bounds. Two out-of-bounds reads in the rootkit module's walk over kernel-supplied structures. A data race on the shared process cache.
 

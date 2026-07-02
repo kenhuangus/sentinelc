@@ -4,7 +4,8 @@ A fast, native-C, on-demand threat-triage scanner for Windows 10/11 (x64).
 It enumerates everything that runs, persists, listens, or hooks input, flags
 anomalies with **explainable** heuristics, detects user-mode rootkit hiding via
 cross-view diffing, and can terminate/disable confirmed threats — all in one
-small `.exe` with no installer, no cloud, no kernel driver.
+small `.exe` that can run without installation, with no cloud dependency and no
+kernel driver.
 
 > **Honest scope.** This is a *triage and response* tool, not a replacement for
 > Defender/EDR. It wins on **speed and transparency** (a full scan in seconds,
@@ -16,12 +17,14 @@ small `.exe` with no installer, no cloud, no kernel driver.
 
 | Family | Rules (examples) |
 |---|---|
-| Malicious processes | `PROC.MASQUERADE`, `PROC.TEMP_PATH`, `PROC.RWX_MEM`, `PROC.PACKED`, `PROC.SUSPICIOUS_PARENT` |
-| Suspicious services | `SVC.UNSIGNED`, `SVC.USERWRITABLE_PATH`, `SVC.UNQUOTED_PATH`, `SVC.SUSPICIOUS_DLL` |
-| Persistence | `PERSIST.RUNKEY`, `PERSIST.WINLOGON`, `PERSIST.IFEO`, `PERSIST.APPINIT`, `PERSIST.TASK`, `PERSIST.WMI_SUB`, `PERSIST.STARTUP_FOLDER`, `PERSIST.COM_HIJACK` |
+| Malicious processes | `PROC.MASQUERADE`, `PROC.TEMP_PATH`, `PROC.RWX_MEM`, `PROC.PACKED`, `PROC.SUSPICIOUS_PARENT`, `PROC.LOLBIN_ARGS`, `PROC.ENCODED_CMD`, `PROC.PPID_SPOOF` |
+| Suspicious services | `SVC.UNSIGNED`, `SVC.UNVERIFIED`, `SVC.USERWRITABLE_PATH`, `SVC.UNQUOTED_PATH`, `SVC.SUSPICIOUS_DLL` |
+| Persistence | `PERSIST.RUNKEY`, `PERSIST.WINLOGON`, `PERSIST.IFEO`, `PERSIST.APPINIT`, `PERSIST.APPCERT`, `PERSIST.LSA_PROVIDER`, `PERSIST.TASK`, `PERSIST.WMI_SUB`, `PERSIST.SVC_REGISTRY`, `PERSIST.COM_HIJACK` |
 | C2 / RCE / reverse shells | `NET.SHELL_SOCKET`, `NET.LISTEN_SUSPICIOUS_PROC`, `NET.RAW_IP_OUTBOUND`, `NET.BEACON`, `NET.IOC_MATCH` |
-| Keyloggers / hooks | `KEY.LL_HOOK`, `KEY.RAW_INPUT`, `KEY.POLL_HEURISTIC`, `KEY.INJECTED_DLL` |
+| Keyloggers / spyware | `KEY.LL_HOOK`, `KEY.RAW_INPUT`, `KEY.POLL_HEURISTIC`, `SPY.MULTI_CAPTURE`, `SPY.CLIPBOARD`, `SPY.SCREEN_CAPTURE` |
 | Rootkits (cross-view) | `RK.HIDDEN_PROC`, `RK.HIDDEN_FILE`, `RK.SUSPICIOUS_DRIVER` |
+| Credential, memory, evasion | `CRED.LSASS_HANDLE`, `CRED.SENSITIVE_FILE`, `MEM.SHELLCODE`, `MEM.REFLECTIVE_PE`, `PROC.HOLLOWED`, `EVADE.AMSI_PATCH`, `EVADE.ETW_PATCH` |
+| File integrity | `FIM.MODIFIED`, `FIM.ADDED`, `FIM.REMOVED`, `FIM.BASELINE_TAMPERED` |
 | Offline-like hunting | `OFFLINE.SNAPSHOT`, `OFFLINE.RAW_VOLUME`, `OFFLINE.DEFENDER_EXCLUSION`, `OFFLINE.BOOT_DRIVER`, `OFFLINE.RUNKEY` |
 | Correlation | `CORR.IMPLANT` (unsigned multi-signal), `CORR.MULTI_SIGNAL` |
 
@@ -88,7 +91,7 @@ sentinelc.exe [scan-mode] [options]
 
 Scan modes:
   --quick            process + service + persistence + network   (default, fast)
-  --full             everything (adds keylogger + rootkit cross-view)
+  --full             all live scanners (adds keylogger, rootkit, creds, memory, evasion)
   --deep             hash files / heavier checks
   --watch N          sample network for N seconds to catch C2 beaconing
   --scan-path PATH   scan a file or directory only (entropy/signing/IOC)

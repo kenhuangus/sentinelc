@@ -5,7 +5,7 @@
 .DESCRIPTION
   Invoked by the "\SentinelC\FullScan" scheduled task, which runs as
   NT AUTHORITY\SYSTEM with highest privileges (no UAC). Reads config.json
-  (console URL + DPAPI-protected token) from its own directory, runs
+  (console URL + DPAPI-protected host ingest token) from its own directory, runs
   sentinelc.exe --full --json, wraps it in the ingest envelope, and POSTs it
   to the Fleet Console. Writes a daily log under .\logs.
 
@@ -33,7 +33,7 @@ function Assert-SafeConsoleUrl {
   }
   if ($uri.Scheme -eq 'https') { return }
   if ($uri.Scheme -eq 'http' -and $uri.IsLoopback) { return }
-  throw "Refusing to send the fleet token over non-loopback plaintext HTTP. Use https:// or http://127.0.0.1 for local-only testing."
+  throw "Refusing to send the host ingest token over non-loopback plaintext HTTP. Use https:// or http://127.0.0.1 for local-only testing."
 }
 
 try {
@@ -43,7 +43,7 @@ try {
   if ([string]::IsNullOrWhiteSpace($consoleUrl)) { throw "config has no consoleUrl" }
   Assert-SafeConsoleUrl -Url $consoleUrl
 
-  # Decrypt the bearer token (DPAPI LocalMachine: only this machine can read it).
+  # Decrypt the host ingest bearer token (DPAPI LocalMachine: only this machine can read it).
   Add-Type -AssemblyName System.Security
   $protected  = [Convert]::FromBase64String($cfg.tokenProtected)
   $tokenBytes = [Security.Cryptography.ProtectedData]::Unprotect(

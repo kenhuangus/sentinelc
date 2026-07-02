@@ -1,230 +1,142 @@
-# Architecture — SentinelC
+# SentinelC Architecture
 
-## 1. Overview
+## Overview
 
-SentinelC is a single user-mode Win32 C executable. It is organized as a small
-core (CLI, scheduler, finding bus, reporter) plus independent **scanner
-modules** that each emit `Finding` records, and a **responder** that acts on
-findings. Everything is read-only until the responder is explicitly invoked.
+SentinelC is a single user-mode Win32 C executable. The engine parses CLI
+configuration, builds a shared process table, runs scanner modules, correlates
+findings, renders console or JSON output, and only then invokes responder actions
+when the operator explicitly requested them.
 
-```
-                         +------------------------+
-                         |        main()          |
-                         |  CLI parse / config    |
-                         +-----------+------------+
-                                     |
-                         +-----------v------------+
-                         |     Scan Engine        |
-                         |  (orchestrator, thread |
-                         |   pool, finding bus)    |
-                         +--+----+----+----+----+--+
-                            |    |    |    |    |
-        +-------------------+    |    |    |    +--------------------+
-        |          +-------------+    |    +----------+             |
-        v          v                  v               v             v
-  +----------+ +---------+      +-----------+   +-----------+  +-----------+
-  | Process  | | Service |      |  Rootkit  |   |  Network  |  |Persistence|
-  | Scanner  | | Scanner |      | Cross-View|   |  Scanner  |  |  Scanner  |
-  +----+-----+ +----+----+      +-----+-----+   +-----+-----+  +-----+-----+
-       |            |                 |               |              |
-       +------+-----+--------+--------+-------+-------+------+-------+
-              |              |                 |              |
-         +----v----+   +-----v-----+    +------v-----+   +----v-----+
-         |  PE /    |   |  Signing  |    |  Entropy / |   | Keylogger|
-         | Image    |   | (WinTrust)|    |  Heuristic |   |  /Hook   |
-         | Utils    |   |           |    |  Engine    |   | Scanner  |
-         +----+-----+   +-----+-----+    +------+-----+   +----+-----+
-              |               |                 |              |
-              +-------+-------+--------+--------+------+-------+
-                      |                |               |
-                      v                v               v
-              +---------------------------------------------+
-              |            Finding Bus (in-memory)          |
-              |   dedup, correlate, score (sev x conf)      |
-              +----------------------+----------------------+
-                                     |
-                  +------------------+------------------+
-                  v                                     v
-          +---------------+                     +----------------+
-          |   Reporter    |                     |   Responder    |
-          | console/JSON  |                     | kill/suspend/  |
-          |               |                     | disable/quarant|
-          +---------------+                     +-------+--------+
-                                                        |
-                                                +-------v--------+
-                                                |  Audit Log     |
-                                                | (append-only)  |
-                                                +----------------+
-```
+The tool is read-only by default. Destructive actions are gated by explicit
+flags or interactive prompts and are written to the audit log.
 
-## 2. Core data structures
+## Core Flow
+
+1. `main.c` parses the CLI into `Config`.
+2. `scan_process.c` runs first and fills the shared `ProcTable`.
+3. Remaining live scanners run on a Win32 thread pool:
+   service, persistence, network, keylogger/spyware, rootkit, credential access,
+   memory scan, and AMSI/ETW evasion checks.
+4. Optional special modes run separately:
+   `--scan-path`, `--baseline`, `--integrity`, and `--offline-like`.
+5. `correlate()` adds multi-signal findings.
+6. `suppress_apply()` removes known false positives.
+7. `report.c` writes human or JSON output.
+8. `respond.c` performs only the requested response actions.
+
+## Shared Types
+
+The authoritative definitions are in `include/sentinelc.h`.
 
 ```c
-typedef enum { SEV_INFO, SEV_LOW, SEV_MED, SEV_HIGH, SEV_CRIT } Severity;
-
 typedef struct {
-    char        rule_id[32];      // e.g. "PROC.UNSIGNED_SYS32"
-    Severity    severity;
-    int         confidence;       // 0-100
-    char        title[128];
-    char        evidence[512];    // human-readable proof
-    char        target[260];      // path / pid / service name
-    DWORD       pid;              // 0 if N/A
-    char        recommended[64];  // "kill" | "disable" | "quarantine" | "review"
+    char       rule_id[SC_RULEID_LEN];   /* 40 bytes */
+    Severity   severity;
+    int        confidence;               /* 0..100 */
+    char       title[SC_TITLE_LEN];      /* 160 bytes */
+    char       evidence[SC_EVID_LEN];    /* 1024 bytes */
+    char       target[SC_MAX_PATH];      /* 1024 bytes */
+    DWORD      pid;                      /* 0 if N/A */
+    ActionKind recommended;
 } Finding;
 
 typedef struct {
-    Finding*    items;
-    size_t      count, cap;
-    CRITICAL_SECTION lock;        // scanners push concurrently
+    Finding         *items;
+    size_t           count;
+    size_t           cap;
+    CRITICAL_SECTION lock;
 } FindingBus;
 ```
 
-Scanners never print. They only `bus_push(&bus, finding)`. This keeps modules
-testable and the output centralized and rankable.
+Scanners do not print directly. They emit findings through `bus_emit()` and let
+the reporter handle presentation.
 
-## 3. Modules
+## Scanner Modules
 
-### 3.1 Scan Engine (orchestrator)
-- Parses config, requests privileges (`SeDebugPrivilege`, checks Admin).
-- Dispatches scanners on a small Win32 thread pool (`QueueUserWorkItem` /
-  `CreateThreadpoolWork`). Modules are independent → embarrassingly parallel.
-- Joins, then runs the **correlation** pass on the finding bus.
+- `scan_process.c`: process inventory, image path, command line, signer state,
+  packed-image checks, RWX/unbacked executable memory, parent-chain heuristics,
+  PPID spoofing, LOLBin arguments, and encoded PowerShell.
+- `scan_service.c`: service and driver inventory, service binary normalization,
+  signature/path checks, unquoted paths, and suspicious `svchost` service DLLs.
+- `scan_persist.c`: Run keys, Winlogon, AppInit, AppCertDLLs, IFEO,
+  SilentProcessExit, startup folders, scheduled tasks, WMI subscriptions, COM
+  hijacks, service registry view, Defender/security-service tamper, proxy
+  settings, browser extensions, and App Paths.
+- `scan_network.c`: TCP/UDP endpoints, suspicious listeners, shell-socket shape,
+  raw-IP outbound connections, IOC IP matches, and optional beacon sampling.
+- `scan_keylog.c`: low-level hooks, raw input, key-state polling, clipboard,
+  screen, media-capture, and credential-API capability combinations.
+- `scan_rootkit.c`: process and file cross-view checks plus loaded driver
+  inventory. It documents the user-mode limitation against advanced DKOM.
+- `scan_creds.c`: LSASS handle access and sensitive file/browser credential
+  handle access.
+- `scan_memscan.c`: private executable memory, reflective PE markers, shellcode
+  markers, and process hollowing checks.
+- `scan_evade.c`: AMSI and ETW prologue integrity checks in live processes.
+- `scan_path.c`: targeted file/directory scan, PE/signing/entropy checks, hash
+  IOC checks, YARA-lite rules, and full-file string IOC streaming.
+- `scan_integrity.c`: Merkle file-integrity baseline/check. Both baseline and
+  integrity modes stream-hash file contents; baselines are HMAC-authenticated
+  with a DPAPI-wrapped key.
+- `scan_offline.c`: no-reboot offline-like hunting through VSS snapshots,
+  offline hive inspection, boot-driver checks, Defender exclusion checks, and
+  raw-volume probes where accessible.
 
-### 3.2 Process Scanner (`scan_process.c`)
-- Primary enumeration: `NtQuerySystemInformation(SystemProcessInformation)` for
-  full data in one syscall (fast); fallback `CreateToolhelp32Snapshot`.
-- For each process: open with least privilege, get image path
-  (`QueryFullProcessImageName`), command line (PEB read or `NtQuery...`),
-  token user + integrity level, parent PID.
-- Calls Signing + PE utils + Entropy engine on the image.
-- Memory anomaly check: `VirtualQueryEx` scan for private RWX regions / executable
-  regions not backed by an image (injection heuristic).
-- Emits findings: `PROC.UNSIGNED_SYS32`, `PROC.MASQUERADE`, `PROC.TEMP_PATH`,
-  `PROC.RWX_MEM`, `PROC.SUSPICIOUS_PARENT`, `PROC.PACKED`.
+## Response Model
 
-### 3.3 Service Scanner (`scan_service.c`)
-- `OpenSCManager` + `EnumServicesStatusEx` (all services, all states).
-- Per service: `QueryServiceConfig` → binary path, start type, account.
-- Resolve binary, run Signing + path checks. Cross-reference PID if running.
-- Findings: `SVC.UNSIGNED`, `SVC.USERWRITABLE_PATH`, `SVC.UNQUOTED_PATH`,
-  `SVC.SUSPICIOUS_DLL` (svchost groups), `SVC.RECENT` (creation time heuristic).
+`respond.c` supports process kill, process suspend, service disable, and file
+quarantine. Important safety properties:
 
-### 3.4 Rootkit Cross-View Scanner (`scan_rootkit.c`)
-- **Process cross-view**: build PID sets from 4 sources — Toolhelp,
-  `EnumProcesses`, `NtQuerySystemInformation`, `WTSEnumerateProcesses`. Any PID
-  present in one but hidden from another → `RK.HIDDEN_PROC`.
-- **File cross-view**: for sensitive dirs, diff `FindFirstFile/FindNextFile`
-  against `NtQueryDirectoryFile` → `RK.HIDDEN_FILE`.
-- **Driver inventory**: `EnumDeviceDrivers` + `GetDeviceDriverFileName`; verify
-  signature; flag non-Microsoft unsigned drivers → `RK.SUSPICIOUS_DRIVER`.
-- Documented limit: cannot see a driver that unlinks itself from the loaded-
-  module list (DKOM). v1 catches naive hooks and user-mode hiding.
+- Dry-run by default.
+- Confirmation required unless `--yes`.
+- Critical processes are refused unless `--force-critical`.
+- Process actions open one handle, validate the image from that handle, prompt,
+  then revalidate before acting to avoid PID-reuse races.
+- Quarantine opens the source with `FILE_FLAG_OPEN_REPARSE_POINT`, rejects
+  reparse points/directories, creates a SYSTEM/Admin-only quarantine directory,
+  moves by handle, and uses copy/delete fallback for cross-volume moves.
 
-### 3.5 Network Scanner (`scan_network.c`)
-- `GetExtendedTcpTable` / `GetExtendedUdpTable` (with owning PID).
-- Join endpoints to processes from the Process Scanner cache.
-- Findings: `NET.LISTEN_SUSPICIOUS_PROC`, `NET.RAW_IP_OUTBOUND`,
-  `NET.SHELL_SOCKET` (process owns socket + child cmd/powershell),
-  `NET.IOC_MATCH` (local IOC IP list). Optional `--watch N` samples N seconds to
-  detect periodic beaconing (jitter/interval scoring).
+## Fleet Console And Endpoint Agent
 
-### 3.6 Persistence Scanner (`scan_persist.c`)
-- Registry: Run/RunOnce (HKLM+HKCU+Wow64), Winlogon (Shell/Userinit),
-  AppInit_DLLs, IFEO debuggers, common COM-hijack CLSIDs.
-- Filesystem: Startup folders (all users + current).
-- Scheduled Tasks: parse `%WINDIR%\System32\Tasks` XML (or COM ITaskService).
-- WMI: query `__EventFilter`, `__EventConsumer`, `__FilterToConsumerBinding`.
-- Each entry's target binary runs through Signing/PE checks.
-- Findings: `PERSIST.RUNKEY`, `PERSIST.IFEO`, `PERSIST.WMI_SUB`,
-  `PERSIST.TASK`, `PERSIST.STARTUP_FOLDER`, `PERSIST.COM_HIJACK`.
+`fleet-console/server.js` is a zero-dependency Node.js dashboard. Read APIs use a
+console bearer token. Ingest uses per-host bearer tokens, so a host token can
+only submit for its configured hostname. Helper upload scripts reject
+non-loopback plaintext HTTP.
 
-### 3.7 Keylogger / Hook Scanner (`scan_keylog.c`)
-- Enumerate top-level windows / threads; where determinable, detect global
-  `WH_KEYBOARD_LL`/`WH_MOUSE_LL` hook owners.
-- `GetRegisteredRawInputDevices` per process where accessible; flag keyboard
-  raw-input registrants that aren't expected apps.
-- Static heuristic: for each process image, check IAT for the hook/poll APIs
-  (`SetWindowsHookEx`, `GetAsyncKeyState`, `RegisterRawInputDevices`,
-  `GetRawInputData`) combined with file-write or network capability → score.
-- Findings: `KEY.LL_HOOK`, `KEY.RAW_INPUT`, `KEY.POLL_HEURISTIC`.
+`installer/install.ps1` installs `sentinelc.exe`, rules, and agent scripts into
+an ACL-locked directory, stores the host ingest token protected with DPAPI
+LocalMachine scope, and registers a SYSTEM scheduled task for daily/startup/on
+demand scans.
 
-### 3.8 Shared utilities
-- **PE/Image utils** (`pe.c`): map file, parse headers, section entropy,
-  imports (IAT) enumeration, detect packers (entropy + section names like
-  `UPX0`, missing imports).
-- **Signing** (`sign.c`): `WinVerifyTrust` Authenticode + catalog signature;
-  extract signer subject; cache results by path+mtime to avoid recomputation.
-- **Entropy/Heuristic engine** (`heur.c`): Shannon entropy, scoring helpers,
-  allowlist matching, path classification (system vs user-writable vs temp).
-- **IOC** (`ioc.c`): optional local lists — SHA-256 hashes, bad IPs/domains,
-  tiny built-in YARA-subset string rules.
+## Build And Layout
 
-### 3.9 Reporter (`report.c`)
-- Sorts findings by `severity` then `confidence`.
-- Console: ANSI-colored table; summary counts; explicit "limitations" footer
-  (e.g. "not elevated → driver scan skipped").
-- `--json`: array of Finding objects for SIEM.
-
-### 3.10 Responder (`respond.c`)
-- Actions: `TerminateProcess`, `NtSuspendProcess`/thread suspend,
-  `ChangeServiceConfig` → Disabled + `ControlService` stop, quarantine = move to
-  `%PROGRAMDATA%\SentinelC\quarantine\` + deny-all ACL + record original path.
-- **Guards**: never-kill list (PID 0/4, csrss, wininit, services, lsass unless
-  `--force-critical`); confirmation prompt unless `--yes`; dry-run unless an
-  action flag is present.
-- Writes every attempted/actual action to the append-only audit log.
-
-## 4. Privilege model
-- Detect Admin (`CheckTokenMembership` for Administrators).
-- Enable `SeDebugPrivilege` when present (process memory/handles).
-- Each scanner degrades gracefully: on `ACCESS_DENIED`, emit an `INFO` finding
-  that the check was partial, never crash. Reporter aggregates skipped checks.
-
-## 5. Concurrency & performance
-- Scanners run in parallel on a thread pool.
-- Single process enumeration pass is cached and shared (network/keylog/service
-  reuse it — no re-enumeration).
-- Signing results cached by `path+mtime` (the expensive call).
-- Target: quick scan < 10s by avoiding per-file hashing unless `--deep`.
-
-## 6. Build & layout
-```
+```text
 sentinelc/
-  src/
-    main.c            CLI, config, orchestration entry
-    engine.c/.h       thread pool, finding bus, correlation
-    scan_process.c
-    scan_service.c
-    scan_rootkit.c
-    scan_network.c
-    scan_persist.c
-    scan_keylog.c
-    pe.c  sign.c  heur.c  ioc.c
-    report.c  respond.c  audit.c
-    util.c  (string, path, registry helpers)
   include/sentinelc.h
-  rules/   ioc_hashes.txt  ioc_ips.txt  yara_subset.txt  allowlist.txt
-  tests/   (VM test fixtures, planted-threat scripts)
-  CMakeLists.txt   Makefile (MinGW)   build.ps1
+  src/*.c
+  rules/
+  fleet-console/
+  installer/
+  codex/
+  tests/
+  Makefile
+  build.ps1
+  build.sh
 ```
-- Toolchains: MSVC (`cl` / CMake) and MinGW-w64 (`gcc`). Static-link CRT.
-- Libs: `ntdll`, `advapi32`, `psapi`, `wintrust`, `crypt32`, `iphlpapi`,
-  `wtsapi32`, `wevtapi`, `ole32`, `oleaut32` (WMI/tasks via COM).
 
-## 7. Correlation pass (why a flat scanner isn't enough)
-After all scanners push, the engine runs cross-module correlation to *raise
-confidence and reduce noise*:
-- A process that is (unsigned in temp) **and** (listening) **and** (has a Run
-  key) **and** (spawns powershell) → single high-confidence `CORR.IMPLANT`
-  finding instead of 4 medium ones.
-- A service whose binary equals a flagged process image → merge.
-- Correlation is what makes the output actionable rather than a wall of
-  medium-severity noise.
+Supported build paths are MinGW-w64 through `build.ps1`, `build.sh`, or
+`Makefile`. The current build scripts add stack-protector, FORTIFY,
+format-string checks, ASLR, DEP, and high-entropy ASLR flags. CFG/CET remain an
+MSVC release-build concern.
 
-## 8. Testing strategy (summary; detail in plan.md)
-- Unit tests for `pe.c`, `heur.c`, `sign.c` (golden files).
-- Integration: a Windows test VM with planted artifacts (EICAR, nc reverse
-  shell, SetWindowsHookEx keylogger, Run-key persistence, userland hider) —
-  assert each is flagged with the right rule id, and that dry-run mutates
-  nothing (audit log diff).
+Current Windows build output is about 1.1 MB.
+
+## Important Limits
+
+- No kernel driver ships in this repo. Advanced kernel rootkits can hide from
+  user-mode cross-view checks.
+- `--offline-like` narrows the Defender Offline gap without rebooting, but the
+  live Windows kernel is still active.
+- The YARA implementation is intentionally a lightweight subset, not libyara.
+- Defender/SmartScreen may flag unsigned development builds; production release
+  needs code signing.
