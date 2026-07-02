@@ -78,7 +78,8 @@ build\sentinelc.exe --full
 ### One-click elevated launcher
 Double-click **`sentinelc-admin.cmd`** (or run it from any prompt). It triggers
 the UAC prompt, runs `--full`, keeps the window open, and points you at the
-audit log. Pass your own args: `sentinelc-admin.cmd --quick --json`.
+audit log. For custom scan arguments, use the PowerShell launcher instead:
+`powershell -ExecutionPolicy Bypass -File sentinelc-admin.ps1 --quick --json`.
 
 ## Usage
 
@@ -171,8 +172,8 @@ build\sentinelc.exe --integrity --integrity-roots "C:\path\to\project"
 `--baseline` hashes every execution-relevant file (PE binaries, scripts, source
 code, `.md`, and execution-affecting config) under the chosen roots, builds a
 **Merkle tree** (leaf = `SHA256(lowercased-abspath ‖ content-hash)`, combined
-pairwise to a single root), and stores a sorted manifest. `--integrity` re-walks
-and diffs against it:
+pairwise to a single root), and stores a sorted manifest. `--integrity` re-walks,
+rehashes file contents, and diffs against it:
 
 - The **Merkle root** is a single hash that proves the whole set is unchanged
   (`[MATCH]`) or changed (`[CHANGED]`) in one comparison.

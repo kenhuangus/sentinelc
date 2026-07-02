@@ -22,12 +22,15 @@
 #include <bcrypt.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(s) (((NTSTATUS)(s)) >= 0)
 #endif
 
 #define SCAN_MAX_DEPTH 32
+#define CONTENT_SCAN_CHUNK   (1u * 1024u * 1024u)
+#define CONTENT_SCAN_OVERLAP (64u * 1024u)
 
 /* Cumulative count of files analyzed in this scan (drives the progress bar).
  * Single-threaded scanner, so a plain file-local counter is sufficient. */
@@ -148,32 +151,6 @@ static uint64_t count_files(const char *dir, int depth)
     return total;
 }
 
-/* Read up to cap-1 bytes of a file into buf and NUL-terminate. Embedded NUL
- * bytes are replaced with spaces so ASCII markers inside binaries still match a
- * substring search. Returns bytes read (0 on error). */
-static size_t read_file_text(const char *path, char *buf, size_t cap, bool strip)
-{
-    if (cap == 0) return 0;
-    wchar_t wpath[SC_MAX_PATH * 2];
-    if (utf8_to_wide(path, wpath, sizeof wpath / sizeof wpath[0]) == 0)
-        return 0;
-    HANDLE h = CreateFileW(wpath, GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                           NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    if (h == INVALID_HANDLE_VALUE) return 0;
-    DWORD rd = 0;
-    BOOL ok = ReadFile(h, buf, (DWORD)(cap - 1), &rd, NULL);
-    CloseHandle(h);
-    if (!ok) return 0;
-    /* strip=true: NUL -> space for the NUL-terminated substring IOC matcher.
-     * strip=false: keep raw bytes (YARA wide/hex patterns rely on the NULs). */
-    if (strip)
-        for (DWORD i = 0; i < rd; i++)
-            if (buf[i] == '\0') buf[i] = ' ';
-    buf[rd] = '\0';
-    return rd;
-}
-
 static bool yara_rule_applies_to_file(const char *rule, bool is_pe)
 {
     if (!rule || !is_pe)
@@ -206,6 +183,78 @@ static bool is_current_scanner_image(const char *path)
     full[sizeof(full) - 1] = '\0';
 
     return _stricmp(self, full) == 0;
+}
+
+static void scan_content_indicators(ScanCtx *c, const char *path, bool is_pe)
+{
+    if (!c || (!c->yara && !c->ioc))
+        return;
+
+    wchar_t wpath[SC_MAX_PATH * 2];
+    if (utf8_to_wide(path, wpath, sizeof wpath / sizeof wpath[0]) == 0)
+        return;
+
+    HANDLE h = CreateFileW(wpath, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+
+    size_t cap = CONTENT_SCAN_CHUNK + CONTENT_SCAN_OVERLAP + 1;
+    unsigned char *raw = (unsigned char *)malloc(cap);
+    char *text = c->ioc ? (char *)malloc(cap) : NULL;
+    if (!raw || (c->ioc && !text)) {
+        free(raw);
+        free(text);
+        CloseHandle(h);
+        return;
+    }
+
+    bool yara_found = false;
+    bool string_found = false;
+    size_t carry = 0;
+    for (;;) {
+        DWORD rd = 0;
+        if (!ReadFile(h, raw + carry, CONTENT_SCAN_CHUNK, &rd, NULL))
+            break;
+        if (rd == 0)
+            break;
+
+        size_t got = carry + rd;
+        if (!yara_found && c->yara) {
+            char rulename[80];
+            if (yara_scan(c->yara, raw, got, rulename, sizeof rulename) &&
+                yara_rule_applies_to_file(rulename, is_pe)) {
+                bus_emit(c->bus, "FILE.YARA_MATCH", SEV_HIGH, 85, ACT_QUARANTINE,
+                         0, path, "File content matches a YARA rule",
+                         "matched YARA rule '%s'", rulename);
+                yara_found = true;
+            }
+        }
+
+        if (!string_found && c->ioc) {
+            memcpy(text, raw, got);
+            for (size_t i = 0; i < got; i++)
+                if (text[i] == '\0') text[i] = ' ';
+            text[got] = '\0';
+            if (ioc_match_string(c->ioc, text)) {
+                bus_emit(c->bus, "FILE.IOC_STRING", SEV_HIGH, 90, ACT_QUARANTINE,
+                         0, path, "File content matches a known-bad string IOC",
+                         "matched a loaded indicator (string/C2 domain)");
+                string_found = true;
+            }
+        }
+
+        if ((!c->yara || yara_found) && (!c->ioc || string_found))
+            break;
+
+        carry = got < CONTENT_SCAN_OVERLAP ? got : CONTENT_SCAN_OVERLAP;
+        memmove(raw, raw + got - carry, carry);
+    }
+
+    free(raw);
+    free(text);
+    CloseHandle(h);
 }
 
 /* Examine a single file and emit findings. */
@@ -313,34 +362,7 @@ static void scan_one_file(ScanCtx *c, const char *path)
     }
 
     /* ---- content checks: YARA-subset rules (raw bytes) + string IOC ---- */
-    if (c->yara || c->ioc) {
-        /* 1 MiB scan window; single-threaded scanner so a static is safe and
-         * avoids a per-file allocation. Read RAW (no NUL strip) for YARA. */
-        static char content[1u << 20];
-        size_t got = read_file_text(path, content, sizeof content, false);
-        if (got > 0) {
-            char rulename[80];
-            if (c->yara &&
-                yara_scan(c->yara, (const unsigned char *)content, got,
-                          rulename, sizeof rulename) &&
-                yara_rule_applies_to_file(rulename, is_pe)) {
-                bus_emit(c->bus, "FILE.YARA_MATCH", SEV_HIGH, 85, ACT_QUARANTINE,
-                         0, path, "File content matches a YARA rule",
-                         "matched YARA rule '%s'", rulename);
-            }
-            /* the string IOC matcher is NUL-terminated; strip embedded NULs. */
-            if (c->ioc) {
-                for (size_t i = 0; i < got; i++)
-                    if (content[i] == '\0') content[i] = ' ';
-                content[got] = '\0';
-                if (ioc_match_string(c->ioc, content)) {
-                    bus_emit(c->bus, "FILE.IOC_STRING", SEV_HIGH, 90, ACT_QUARANTINE,
-                             0, path, "File content matches a known-bad string IOC",
-                             "matched a loaded indicator (string/C2 domain)");
-                }
-            }
-        }
-    }
+    scan_content_indicators(c, path, is_pe);
 }
 
 /* Recurse into a directory. depth bounds the descent; reparse points are

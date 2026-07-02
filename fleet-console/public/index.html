@@ -181,6 +181,32 @@
   var selected = null;
   var sortKey = 'critical';
   var sortDir = -1;
+  var tokenKey = 'sentinelcFleetConsoleToken';
+  var apiToken = window.localStorage.getItem(tokenKey) || '';
+
+  function ensureToken() {
+    while (!apiToken) {
+      var v = window.prompt('Fleet console token');
+      if (v === null) throw new Error('token required');
+      apiToken = String(v).trim();
+      if (apiToken) window.localStorage.setItem(tokenKey, apiToken);
+    }
+  }
+
+  function apiFetch(path) {
+    ensureToken();
+    return fetch(path, {
+      cache: 'no-store',
+      headers: { Authorization: 'Bearer ' + apiToken }
+    }).then(function (r) {
+      if (r.status === 401) {
+        window.localStorage.removeItem(tokenKey);
+        apiToken = '';
+        throw new Error('unauthorized');
+      }
+      return r;
+    });
+  }
 
   function fmtTime(iso) {
     if (!iso) return '—';
@@ -274,7 +300,7 @@
     renderFleet();
     var el = document.getElementById('detail');
     el.innerHTML = '<div class="empty">Loading…</div>';
-    fetch('/api/host/' + encodeURIComponent(name)).then(function (r) {
+    apiFetch('/api/host/' + encodeURIComponent(name)).then(function (r) {
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
     }).then(function (d) {
@@ -331,7 +357,10 @@
   }
 
   function load() {
-    fetch('/api/hosts').then(function (r) { return r.json(); }).then(function (d) {
+    apiFetch('/api/hosts').then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function (d) {
       hosts = d || [];
       renderFleet();
       document.getElementById('refresh-note').textContent = 'Updated ' + new Date().toLocaleTimeString() + ' · auto-refresh 15s';

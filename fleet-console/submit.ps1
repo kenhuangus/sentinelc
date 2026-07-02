@@ -24,10 +24,23 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Assert-SafeConsoleUrl {
+  param([Parameter(Mandatory = $true)][string]$Url)
+  try {
+    $uri = [Uri]$Url
+  } catch {
+    throw "ConsoleUrl is not a valid URI: $Url"
+  }
+  if ($uri.Scheme -eq 'https') { return }
+  if ($uri.Scheme -eq 'http' -and $uri.IsLoopback) { return }
+  throw "Refusing to send the fleet token over non-loopback plaintext HTTP. Use https:// or http://127.0.0.1 for local-only testing."
+}
+
 if ([string]::IsNullOrWhiteSpace($Token)) {
   Write-Error "No token supplied. Pass -Token or set SENTINELC_FLEET_TOKEN."
   exit 1
 }
+Assert-SafeConsoleUrl -Url $ConsoleUrl
 
 # Locate the scanner relative to this script.
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path

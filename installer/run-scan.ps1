@@ -24,11 +24,24 @@ if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out
 $logFile = Join-Path $logDir ("scan-{0:yyyyMMdd}.log" -f (Get-Date))
 function Log($m) { Add-Content -Path $logFile -Value ("{0} {1}" -f (Get-Date).ToString("o"), $m) }
 
+function Assert-SafeConsoleUrl {
+  param([Parameter(Mandatory = $true)][string]$Url)
+  try {
+    $uri = [Uri]$Url
+  } catch {
+    throw "ConsoleUrl is not a valid URI: $Url"
+  }
+  if ($uri.Scheme -eq 'https') { return }
+  if ($uri.Scheme -eq 'http' -and $uri.IsLoopback) { return }
+  throw "Refusing to send the fleet token over non-loopback plaintext HTTP. Use https:// or http://127.0.0.1 for local-only testing."
+}
+
 try {
   if (-not (Test-Path $ConfigPath)) { throw "config not found: $ConfigPath" }
   $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
   $consoleUrl = $cfg.consoleUrl
   if ([string]::IsNullOrWhiteSpace($consoleUrl)) { throw "config has no consoleUrl" }
+  Assert-SafeConsoleUrl -Url $consoleUrl
 
   # Decrypt the bearer token (DPAPI LocalMachine: only this machine can read it).
   Add-Type -AssemblyName System.Security

@@ -27,13 +27,14 @@
 #>
 [CmdletBinding()]
 param(
-  [Parameter(Mandatory = $true)][string]$ConsoleUrl,
-  [Parameter(Mandatory = $true)][string]$Token,
+  [string]$ConsoleUrl,
+  [string]$Token,
   [string]$InstallDir = (Join-Path $env:ProgramFiles "SentinelC"),
   [string]$SourceDir,
   [string]$DailyAt = "03:00",
   [switch]$NoStartup,
-  [switch]$DryRun
+  [switch]$DryRun,
+  [string]$ElevatedArgsPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -44,20 +45,72 @@ if (-not $SourceDir) {
   else { $SourceDir = $here }
 }
 
+function Get-SystemPowerShellPath {
+  $p = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+  if (-not (Test-Path -LiteralPath $p)) { throw "system PowerShell not found at $p" }
+  return $p
+}
+
+function Get-SystemToolPath {
+  param([Parameter(Mandatory = $true)][string]$Name)
+  $p = Join-Path $env:WINDIR ("System32\" + $Name)
+  if (-not (Test-Path -LiteralPath $p)) { throw "system tool not found at $p" }
+  return $p
+}
+
+function Assert-SafeConsoleUrl {
+  param([Parameter(Mandatory = $true)][string]$Url)
+  try {
+    $uri = [Uri]$Url
+  } catch {
+    throw "ConsoleUrl is not a valid URI: $Url"
+  }
+  if ($uri.Scheme -eq 'https') { return }
+  if ($uri.Scheme -eq 'http' -and $uri.IsLoopback) { return }
+  throw "Refusing to persist a non-loopback plaintext HTTP ConsoleUrl. Use https:// or http://127.0.0.1 for local-only testing."
+}
+
+if ($ElevatedArgsPath) {
+  $handoff = Get-Content -LiteralPath $ElevatedArgsPath -Raw | ConvertFrom-Json
+  $ConsoleUrl = [string]$handoff.ConsoleUrl
+  $Token = [string]$handoff.Token
+  $InstallDir = [string]$handoff.InstallDir
+  $SourceDir = [string]$handoff.SourceDir
+  $DailyAt = [string]$handoff.DailyAt
+  $NoStartup = [bool]$handoff.NoStartup
+  $DryRun = [bool]$handoff.DryRun
+  Remove-Item -LiteralPath $ElevatedArgsPath -Force -ErrorAction SilentlyContinue
+}
+
+if ([string]::IsNullOrWhiteSpace($ConsoleUrl)) { throw "ConsoleUrl is required." }
+if ([string]::IsNullOrWhiteSpace($Token)) { throw "Token is required." }
+Assert-SafeConsoleUrl -Url $ConsoleUrl
+
 # --- self-elevate: the single UAC moment -------------------------------------
 $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 $isAdmin   = $principal.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 if (-not $isAdmin -and -not $DryRun) {
   Write-Host "Requesting administrator rights (UAC)..." -ForegroundColor Yellow
+  $handoffPath = Join-Path ([IO.Path]::GetTempPath()) ("sentinelc-install-{0}.json" -f ([guid]::NewGuid().ToString("N")))
+  [ordered]@{
+    ConsoleUrl = $ConsoleUrl
+    Token = $Token
+    InstallDir = $InstallDir
+    SourceDir = $SourceDir
+    DailyAt = $DailyAt
+    NoStartup = [bool]$NoStartup
+    DryRun = [bool]$DryRun
+  } | ConvertTo-Json -Compress | Set-Content -LiteralPath $handoffPath -Encoding UTF8 -Force
   $argList = @(
-    "-ExecutionPolicy", "Bypass", "-NoProfile", "-File", "`"$($MyInvocation.MyCommand.Path)`"",
-    "-ConsoleUrl", "`"$ConsoleUrl`"", "-Token", "`"$Token`"",
-    "-InstallDir", "`"$InstallDir`"", "-SourceDir", "`"$SourceDir`"", "-DailyAt", "`"$DailyAt`""
+    "-ExecutionPolicy", "Bypass", "-NoProfile", "-File", $MyInvocation.MyCommand.Path,
+    "-ElevatedArgsPath", $handoffPath
   )
-  if ($NoStartup) { $argList += "-NoStartup" }
-  try { Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $argList }
-  catch { Write-Error "Elevation was cancelled. Installation aborted." }
+  try { Start-Process -FilePath (Get-SystemPowerShellPath) -Verb RunAs -ArgumentList $argList }
+  catch {
+    Remove-Item -LiteralPath $handoffPath -Force -ErrorAction SilentlyContinue
+    Write-Error "Elevation was cancelled. Installation aborted."
+  }
   return
 }
 
@@ -94,12 +147,13 @@ $cfg | ConvertTo-Json | Set-Content -Path $cfgPath -Encoding UTF8
 
 # --- 3. lock down ACLs --------------------------------------------------------
 # Install dir: SYSTEM/Admins full, Users read+execute (cannot tamper the exe).
-& icacls "$InstallDir" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX" | Out-Null
+$icacls = Get-SystemToolPath -Name "icacls.exe"
+& $icacls "$InstallDir" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX" | Out-Null
 # config.json holds the token: SYSTEM + Admins only, no Users at all.
-& icacls "$cfgPath" /inheritance:r /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F" | Out-Null
+& $icacls "$cfgPath" /inheritance:r /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F" | Out-Null
 
 # --- 4. register the scheduled task as SYSTEM / highest -----------------------
-$action = New-ScheduledTaskAction -Execute "powershell.exe" `
+$action = New-ScheduledTaskAction -Execute (Get-SystemPowerShellPath) `
   -Argument "-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File `"$InstallDir\run-scan.ps1`""
 $triggers = @( New-ScheduledTaskTrigger -Daily -At ([datetime]$DailyAt) )
 if (-not $NoStartup) { $triggers += New-ScheduledTaskTrigger -AtStartup }

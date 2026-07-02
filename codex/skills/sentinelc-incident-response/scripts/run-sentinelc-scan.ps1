@@ -8,7 +8,8 @@ param(
     [int]$WatchSeconds = 0,
     [switch]$Deep,
     [string]$OutputDir,
-    [switch]$NoElevate
+    [switch]$NoElevate,
+    [string]$ElevatedArgsPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,6 +20,25 @@ function Test-IsAdmin {
     return $p.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 }
 
+function Get-SystemPowerShellPath {
+    $p = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $p)) { throw "system PowerShell not found at $p" }
+    return $p
+}
+
+if ($ElevatedArgsPath) {
+    $handoff = Get-Content -LiteralPath $ElevatedArgsPath -Raw | ConvertFrom-Json
+    $ExePath = [string]$handoff.ExePath
+    $RepoRoot = [string]$handoff.RepoRoot
+    $Mode = [string]$handoff.Mode
+    $OfflinePasses = [int]$handoff.OfflinePasses
+    $WatchSeconds = [int]$handoff.WatchSeconds
+    $Deep = [bool]$handoff.Deep
+    $OutputDir = [string]$handoff.OutputDir
+    $NoElevate = $true
+    Remove-Item -LiteralPath $ElevatedArgsPath -Force -ErrorAction SilentlyContinue
+}
+
 function Resolve-SentinelCExe {
     param([string]$ExePath, [string]$RepoRoot)
     if ($ExePath) {
@@ -27,11 +47,7 @@ function Resolve-SentinelCExe {
     if ($RepoRoot) {
         $candidate = Join-Path $RepoRoot 'build\sentinelc.exe'
         if (Test-Path -LiteralPath $candidate) { return (Resolve-Path -LiteralPath $candidate).Path }
-        $build = Join-Path $RepoRoot 'build.ps1'
-        if (Test-Path -LiteralPath $build) {
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $build
-            if (Test-Path -LiteralPath $candidate) { return (Resolve-Path -LiteralPath $candidate).Path }
-        }
+        throw 'SentinelC executable not found under RepoRoot\build. Build it before requesting elevation, or pass -ExePath.'
     }
     $local = Join-Path (Get-Location) 'build\sentinelc.exe'
     if (Test-Path -LiteralPath $local) { return (Resolve-Path -LiteralPath $local).Path }
@@ -44,19 +60,23 @@ if (-not $OutputDir) {
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 
 if (-not $NoElevate -and -not (Test-IsAdmin)) {
+    $handoffPath = Join-Path $OutputDir ('elevate-args-' + [guid]::NewGuid().ToString('N') + '.json')
+    [ordered]@{
+        ExePath = $ExePath
+        RepoRoot = $RepoRoot
+        Mode = $Mode
+        OfflinePasses = $OfflinePasses
+        WatchSeconds = $WatchSeconds
+        Deep = [bool]$Deep
+        OutputDir = $OutputDir
+    } | ConvertTo-Json -Compress | Set-Content -LiteralPath $handoffPath -Encoding UTF8 -Force
     $argList = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass',
-        '-File', ('"' + $PSCommandPath + '"'),
+        '-File', $PSCommandPath,
         '-NoElevate',
-        '-Mode', $Mode,
-        '-OfflinePasses', $OfflinePasses,
-        '-WatchSeconds', $WatchSeconds,
-        '-OutputDir', ('"' + $OutputDir + '"')
+        '-ElevatedArgsPath', $handoffPath
     )
-    if ($ExePath) { $argList += @('-ExePath', ('"' + $ExePath + '"')) }
-    if ($RepoRoot) { $argList += @('-RepoRoot', ('"' + $RepoRoot + '"')) }
-    if ($Deep) { $argList += '-Deep' }
-    Start-Process -Verb RunAs -Wait -FilePath powershell.exe -ArgumentList ($argList -join ' ')
+    Start-Process -Verb RunAs -Wait -FilePath (Get-SystemPowerShellPath) -ArgumentList $argList
     Get-Content -LiteralPath (Join-Path $OutputDir 'status.txt') -ErrorAction SilentlyContinue
     return
 }

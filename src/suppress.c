@@ -7,9 +7,8 @@
  *
  *   1. Built-in, research-based auto-suppression. The noisy heuristic rules
  *      ("looks odd: unsigned / user-writable / RWX / installs a hook") are
- *      suppressed when the offending binary is VALIDLY Authenticode-signed by
- *      Microsoft or a curated trusted publisher. That is the JIT-engine and
- *      signed-service false-positive class. High-signal rules (encoded
+ *      suppressed only when the offending binary is validly Microsoft-signed.
+ *      High-signal rules (encoded
  *      PowerShell, LOLBIN abuse, credential access, reflective PE) are NEVER
  *      auto-suppressed -- a validly signed powershell.exe running an encoded
  *      command IS the attack.
@@ -200,11 +199,11 @@ done:
 /* layer 1: built-in research-based auto-suppression                   */
 /* ------------------------------------------------------------------ */
 
-/* Heuristic rules whose dominant false-positive cause is "validly signed
- * code that legitimately does something that looks odd" (JIT RWX memory,
+/* Heuristic rules whose dominant false-positive cause is Microsoft-signed code
+ * that legitimately does something that looks odd (JIT RWX memory,
  * a signed service listening, an input app installing a keyboard hook,
- * a signed app shipped under AppData). These are safe to auto-suppress
- * when the binary carries a valid signature. Deliberately excludes
+ * a signed app shipped under AppData). These are safe to auto-suppress only
+ * when the binary chains to Microsoft. Deliberately excludes
  * PROC.ENCODED_CMD, PROC.LOLBIN_ARGS, MEM.REFLECTIVE_PE, PROC.HOLLOWED,
  * EVADE.*, CRED.*, PERSIST.* and RK.* -- those are dangerous precisely
  * BECAUSE attackers run them through signed binaries. */
@@ -225,26 +224,6 @@ static bool rule_is_signed_noise(const char *rule_id)
     return false;
 }
 
-/* Publishers we treat as trusted for layer-1 auto-suppression of the noisy
- * rules. Microsoft is handled separately via SIGN_SIGNED_MS. Substring,
- * case-insensitive against the Authenticode subject. */
-static bool signer_is_trusted(const char *signer)
-{
-    if (!signer || !signer[0])
-        return false;
-    static const char *pubs[] = {
-        "Microsoft", "Google", "Mozilla", "Oracle", "Adobe",
-        "Dell", "Intel", "NVIDIA", "Realtek", "Logitech", "Lenovo",
-        "Apple", "Zoom", "Valve", "Discord", "Brave Software",
-        "Kingsoft", "Hewlett", "ASUSTeK", "Synaptics",
-        NULL
-    };
-    for (int i = 0; pubs[i]; ++i)
-        if (ci_contains_local(signer, pubs[i]))
-            return true;
-    return false;
-}
-
 /* ------------------------------------------------------------------ */
 /* resolve the binary a finding is about                               */
 /* ------------------------------------------------------------------ */
@@ -257,8 +236,7 @@ static bool finding_binary(const ScanCtx *c, const Finding *f, char *out, size_t
     if (f->pid && c && c->procs) {
         ProcRec *pr = proctable_find(c->procs, f->pid);
         if (pr && pr->image_path[0]) {
-            strncpy(out, pr->image_path, cap - 1);
-            out[cap - 1] = '\0';
+            snprintf(out, cap, "%s", pr->image_path);
             return true;
         }
     }
@@ -267,8 +245,7 @@ static bool finding_binary(const ScanCtx *c, const Finding *f, char *out, size_t
         DWORD attr = GetFileAttributesA(f->target);
         if (attr != INVALID_FILE_ATTRIBUTES &&
             !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
-            strncpy(out, f->target, cap - 1);
-            out[cap - 1] = '\0';
+            snprintf(out, cap, "%s", f->target);
             return true;
         }
     }
@@ -326,8 +303,6 @@ static const char *should_suppress(const ScanCtx *c, const Finding *f)
         if (!sig_done) { sig = sign_verify(bin, signer, sizeof signer); sig_done = true; }
         if (sig == SIGN_SIGNED_MS)
             return "auto:signed-microsoft";
-        if (sig == SIGN_SIGNED && signer_is_trusted(signer))
-            return "auto:signed-trusted";
     }
 
     return NULL;

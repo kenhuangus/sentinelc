@@ -8,6 +8,15 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $PSCommandPath
+
+function Get-SystemPowerShellPath {
+    $path = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $path)) {
+        throw "System PowerShell not found at $path"
+    }
+    return $path
+}
+
 if (-not $OutputDir) {
     $OutputDir = Join-Path (Get-Location) ('sentinelc-verify-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 }
@@ -24,7 +33,7 @@ $args = @(
 if ($ExePath) { $args += @('-ExePath', $ExePath) }
 if ($RepoRoot) { $args += @('-RepoRoot', $RepoRoot) }
 
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runner @args
+& (Get-SystemPowerShellPath) -NoProfile -ExecutionPolicy Bypass -File $runner @args
 
 $report = Join-Path $OutputDir 'sentinelc.json'
 $plan = Join-Path $OutputDir 'action-plan.md'

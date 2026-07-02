@@ -16,6 +16,15 @@ function Test-IsAdmin {
     return $p.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 }
 
+function Get-SystemToolPath {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    $path = Join-Path $env:WINDIR ("System32\" + $Name)
+    if (-not (Test-Path -LiteralPath $path)) {
+        throw "System tool not found at $path"
+    }
+    return $path
+}
+
 if (-not $EvidenceDir) {
     $EvidenceDir = Join-Path (Get-Location) ('sentinelc-cleanup-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 }
@@ -37,8 +46,9 @@ Get-CimInstance Win32_Process |
     ConvertTo-Json -Depth 4 |
     Out-File -LiteralPath (Join-Path $EvidenceDir 'processes_before.json') -Encoding utf8 -Force
 
-reg.exe export 'HKCU\Software\Microsoft\Windows\CurrentVersion\Run' (Join-Path $EvidenceDir 'hkcu_run_before.reg') /y | Out-Null
-reg.exe export 'HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions' (Join-Path $EvidenceDir 'defender_exclusions_before.reg') /y | Out-Null
+$regExe = Get-SystemToolPath 'reg.exe'
+& $regExe export 'HKCU\Software\Microsoft\Windows\CurrentVersion\Run' (Join-Path $EvidenceDir 'hkcu_run_before.reg') /y | Out-Null
+& $regExe export 'HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions' (Join-Path $EvidenceDir 'defender_exclusions_before.reg') /y | Out-Null
 
 foreach ($ex in $RemoveDefenderExclusionPath) {
     try {
@@ -119,8 +129,8 @@ foreach ($spec in $QuarantineTarget) {
     }
 }
 
-reg.exe export 'HKCU\Software\Microsoft\Windows\CurrentVersion\Run' (Join-Path $EvidenceDir 'hkcu_run_after.reg') /y | Out-Null
-reg.exe export 'HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions' (Join-Path $EvidenceDir 'defender_exclusions_after.reg') /y | Out-Null
+& $regExe export 'HKCU\Software\Microsoft\Windows\CurrentVersion\Run' (Join-Path $EvidenceDir 'hkcu_run_after.reg') /y | Out-Null
+& $regExe export 'HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions' (Join-Path $EvidenceDir 'defender_exclusions_after.reg') /y | Out-Null
 
 $actions | ConvertTo-Json -Depth 4 | Out-File -LiteralPath (Join-Path $EvidenceDir 'actions.json') -Encoding utf8 -Force
 $actions | Format-Table -AutoSize | Out-String -Width 240 | Out-File -LiteralPath (Join-Path $EvidenceDir 'actions.txt') -Encoding utf8 -Force

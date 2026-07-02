@@ -21,6 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <bcrypt.h>
+#include <sddl.h>
 
 #ifndef REG_PROCESS_APPKEY
 #define REG_PROCESS_APPKEY 0x00000001
@@ -151,9 +153,92 @@ static bool enable_named_privilege(const char *name)
     return ok;
 }
 
-static bool run_capture(char *cmdline, char *out, size_t cap, DWORD *exit_code)
+static bool system_tool_path(const char *relative, char *out, size_t cap)
 {
-    if (!cmdline || !out || cap == 0) return false;
+    if (!relative || !out || cap == 0) return false;
+    out[0] = '\0';
+    char sys[SC_MAX_PATH];
+    UINT n = GetSystemDirectoryA(sys, sizeof(sys));
+    if (n == 0 || n >= sizeof(sys))
+        return false;
+    int m = snprintf(out, cap, "%s\\%s", sys, relative);
+    if (m < 0 || (size_t)m >= cap)
+        return false;
+    DWORD attrs = GetFileAttributesA(out);
+    return attrs != INVALID_FILE_ATTRIBUTES &&
+           (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 &&
+           (attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
+}
+
+static bool create_admin_only_dir(const char *path)
+{
+    PSECURITY_DESCRIPTOR sd = NULL;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            "D:P(A;;FA;;;SY)(A;;FA;;;BA)",
+            SDDL_REVISION_1, &sd, NULL))
+        return false;
+
+    SECURITY_ATTRIBUTES sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = sd;
+
+    BOOL ok = CreateDirectoryA(path, &sa);
+    LocalFree(sd);
+    if (!ok)
+        return false;
+
+    DWORD attrs = GetFileAttributesA(path);
+    if (attrs == INVALID_FILE_ATTRIBUTES ||
+        (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+        (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        RemoveDirectoryA(path);
+        return false;
+    }
+    return true;
+}
+
+static bool random_hex(char *out, size_t cap)
+{
+    if (!out || cap < 17) return false;
+    unsigned char bytes[8];
+    if (!BCRYPT_SUCCESS(BCryptGenRandom(NULL, bytes, sizeof(bytes),
+                                        BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
+        return false;
+    static const char hexd[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(bytes); i++) {
+        out[i * 2] = hexd[(bytes[i] >> 4) & 0xF];
+        out[i * 2 + 1] = hexd[bytes[i] & 0xF];
+    }
+    out[16] = '\0';
+    return true;
+}
+
+static bool make_secure_scratch_dir(const char *tmpdir, const char *safe_tag,
+                                    char *out, size_t cap)
+{
+    if (!tmpdir || !safe_tag || !out || cap == 0) return false;
+    out[0] = '\0';
+    for (int i = 0; i < 16; i++) {
+        char nonce[17];
+        if (!random_hex(nonce, sizeof(nonce)))
+            return false;
+        int n = snprintf(out, cap, "%ssentinelc-hive-%lu-%s-%s",
+                         tmpdir, (unsigned long)GetCurrentProcessId(),
+                         safe_tag, nonce);
+        if (n < 0 || (size_t)n >= cap)
+            return false;
+        if (create_admin_only_dir(out))
+            return true;
+    }
+    out[0] = '\0';
+    return false;
+}
+
+static bool run_capture(const char *application, char *cmdline, char *out,
+                        size_t cap, DWORD *exit_code)
+{
+    if (!application || !cmdline || !out || cap == 0) return false;
     out[0] = '\0';
     if (exit_code) *exit_code = 0;
 
@@ -177,7 +262,7 @@ static bool run_capture(char *cmdline, char *out, size_t cap, DWORD *exit_code)
     si.hStdError = wr;
     si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
 
-    BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
+    BOOL ok = CreateProcessA(application, cmdline, NULL, NULL, TRUE,
                              CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
     CloseHandle(wr);
     if (!ok) {
@@ -259,9 +344,16 @@ static bool create_shadow_copy(ScanCtx *c, const char *volume, ShadowCopy *sc)
     sc->id[0] = '\0';
     sc->device[0] = '\0';
 
+    char powershell[SC_MAX_PATH];
+    if (!system_tool_path("WindowsPowerShell\\v1.0\\powershell.exe",
+                          powershell, sizeof(powershell))) {
+        ctx_note_limit(c, "offline-like: could not resolve system PowerShell path.");
+        return false;
+    }
+
     char cmd[4096];
     snprintf(cmd, sizeof(cmd),
-        "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+        "\"%s\" -NoProfile -ExecutionPolicy Bypass -Command "
         "\"$ErrorActionPreference='Stop'; "
         "$r=Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create "
         "-Arguments @{Volume='%s';Context='ClientAccessible'}; "
@@ -269,11 +361,11 @@ static bool create_shadow_copy(ScanCtx *c, const char *volume, ShadowCopy *sc)
         "$s=Get-CimInstance Win32_ShadowCopy | Where-Object { $_.ID -eq $r.ShadowID }; "
         "Write-Output ('ID=' + $r.ShadowID); "
         "Write-Output ('DEVICE=' + $s.DeviceObject)\"",
-        volume);
+        powershell, volume);
 
     char out[4096];
     DWORD code = 0;
-    if (!run_capture(cmd, out, sizeof(out), &code)) {
+    if (!run_capture(powershell, cmd, out, sizeof(out), &code)) {
         ctx_note_limit(c, "offline-like: could not start PowerShell to create a VSS snapshot.");
         return false;
     }
@@ -297,16 +389,22 @@ static bool create_shadow_copy(ScanCtx *c, const char *volume, ShadowCopy *sc)
 static void delete_shadow_copy(ScanCtx *c, const ShadowCopy *sc)
 {
     if (!sc || !sc->id[0]) return;
+    char powershell[SC_MAX_PATH];
+    if (!system_tool_path("WindowsPowerShell\\v1.0\\powershell.exe",
+                          powershell, sizeof(powershell))) {
+        ctx_note_limit(c, "offline-like: could not resolve system PowerShell for VSS cleanup.");
+        return;
+    }
     char cmd[4096];
     snprintf(cmd, sizeof(cmd),
-        "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+        "\"%s\" -NoProfile -ExecutionPolicy Bypass -Command "
         "\"$ErrorActionPreference='Stop'; "
         "$s=Get-CimInstance Win32_ShadowCopy | Where-Object { $_.ID -eq '%s' }; "
         "if($s){ $s | Remove-CimInstance; Write-Output 'DELETED' }\"",
-        sc->id);
+        powershell, sc->id);
     char out[1024];
     DWORD code = 0;
-    if (!run_capture(cmd, out, sizeof(out), &code) || code != 0)
+    if (!run_capture(powershell, cmd, out, sizeof(out), &code) || code != 0)
         ctx_note_limit(c, "offline-like: VSS snapshot cleanup failed for %s.", sc->id);
 }
 
@@ -456,11 +554,11 @@ static bool load_hive_with_copy_fallback(ScanCtx *c, const char *path,
         if (!isalnum((unsigned char)*p) && *p != '_' && *p != '-')
             *p = '_';
 
-    snprintf(out->scratch_dir, sizeof(out->scratch_dir),
-             "%ssentinelc-hive-%lu-%lu-%s",
-             tmpdir, (unsigned long)GetCurrentProcessId(),
-             (unsigned long)GetTickCount(), safe_tag);
-    CreateDirectoryA(out->scratch_dir, NULL);
+    if (!make_secure_scratch_dir(tmpdir, safe_tag,
+                                 out->scratch_dir, sizeof(out->scratch_dir))) {
+        ctx_note_limit(c, "offline-like: could not create a secure hive scratch directory.");
+        return false;
+    }
 
     char hive_base[SC_NAME_LEN];
     base_name(path, hive_base, sizeof(hive_base));
@@ -498,17 +596,31 @@ static bool load_hive_with_copy_fallback(ScanCtx *c, const char *path,
              (unsigned long)GetCurrentProcessId(),
              (unsigned long)GetTickCount(), safe_tag);
 
+    char reg_exe[SC_MAX_PATH];
+    if (!system_tool_path("reg.exe", reg_exe, sizeof(reg_exe))) {
+        ctx_note_limit(c, "offline-like: could not resolve system reg.exe path.");
+        DeleteFileA(out->scratch_path);
+        delete_scratch_dir_files(out->scratch_dir);
+        RemoveDirectoryA(out->scratch_dir);
+        out->scratch_dir[0] = '\0';
+        out->scratch_path[0] = '\0';
+        out->mount_name[0] = '\0';
+        return false;
+    }
+
     char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "reg.exe load HKU\\%s \"%s\"",
+    snprintf(cmd, sizeof(cmd), "\"%s\" load HKU\\%s \"%s\"",
+             reg_exe,
              out->mount_name, out->scratch_path);
     char capout[2048];
     DWORD code = 1;
-    if (run_capture(cmd, capout, sizeof(capout), &code) && code == 0) {
+    if (run_capture(reg_exe, cmd, capout, sizeof(capout), &code) && code == 0) {
         if (RegOpenKeyExA(HKEY_USERS, out->mount_name, 0, KEY_READ, &out->key) == ERROR_SUCCESS)
             return true;
 
-        snprintf(cmd, sizeof(cmd), "reg.exe unload HKU\\%s", out->mount_name);
-        run_capture(cmd, capout, sizeof(capout), &code);
+        snprintf(cmd, sizeof(cmd), "\"%s\" unload HKU\\%s",
+                 reg_exe, out->mount_name);
+        run_capture(reg_exe, cmd, capout, sizeof(capout), &code);
     } else {
         trim_ws(capout);
         ctx_note_limit(c, "offline-like: reg load fallback failed for %s hive (exit %lu): %.180s",
@@ -557,8 +669,12 @@ static void close_loaded_hive(LoadedHive *h)
         char cmd[512];
         char out[512];
         DWORD code = 0;
-        snprintf(cmd, sizeof(cmd), "reg.exe unload HKU\\%s", h->mount_name);
-        run_capture(cmd, out, sizeof(out), &code);
+        char reg_exe[SC_MAX_PATH];
+        if (system_tool_path("reg.exe", reg_exe, sizeof(reg_exe))) {
+            snprintf(cmd, sizeof(cmd), "\"%s\" unload HKU\\%s",
+                     reg_exe, h->mount_name);
+            run_capture(reg_exe, cmd, out, sizeof(out), &code);
+        }
         Sleep(150);
         h->mount_name[0] = '\0';
     }

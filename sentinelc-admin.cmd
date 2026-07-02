@@ -1,32 +1,27 @@
 @echo off
-REM sentinelc-admin.cmd - launch SentinelC elevated (UAC prompt) and keep the
-REM window open. Double-click this, or run it from any cmd window.
-REM All arguments are forwarded to sentinelc.exe (default: --full).
+REM sentinelc-admin.cmd - double-click friendly elevated full scan launcher.
+REM Custom scan arguments are handled by sentinelc-admin.ps1 to avoid passing
+REM raw command text through an elevated cmd.exe boundary.
 setlocal
 set "HERE=%~dp0"
-set "EXE=%HERE%build\sentinelc.exe"
+set "PS=%WINDIR%\System32\WindowsPowerShell\v1.0\powershell.exe"
 
-if not exist "%EXE%" (
-    echo [!] %EXE% not found. Build it first: powershell -ExecutionPolicy Bypass -File "%HERE%build.ps1"
+if not exist "%PS%" (
+    echo [!] System PowerShell not found at "%PS%".
     pause
     exit /b 1
 )
 
-REM Are we already elevated?
-net session >nul 2>&1
-if %errorlevel%==0 goto :run
+if not "%~1"=="" (
+    echo [!] sentinelc-admin.cmd no longer forwards custom arguments.
+    echo     Use: "%PS%" -NoProfile -ExecutionPolicy Bypass -File "%HERE%sentinelc-admin.ps1" --quick --json
+    pause
+    exit /b 2
+)
 
-REM Not elevated: relaunch this script as admin via PowerShell.
-echo [*] Requesting administrator privileges...
-powershell -NoProfile -Command "Start-Process -Verb RunAs -FilePath '%~f0' -ArgumentList '%*'"
-exit /b
-
-:run
-set "ARGS=%*"
-if "%ARGS%"=="" set "ARGS=--full"
-echo [*] Running: sentinelc.exe %ARGS%
+"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%HERE%sentinelc-admin.ps1"
+set "RC=%ERRORLEVEL%"
 echo.
-"%EXE%" %ARGS%
-echo.
-echo [*] Scan complete (exit %errorlevel%). Audit log: %ProgramData%\SentinelC\audit.log
+echo [*] Scan complete (exit %RC%). Audit log: %ProgramData%\SentinelC\audit.log
 pause
+exit /b %RC%

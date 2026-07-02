@@ -7,12 +7,18 @@ param([string]$InstallDir = (Join-Path $env:ProgramFiles "SentinelC"))
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 
+function Get-SystemPowerShellPath {
+  $p = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+  if (-not (Test-Path -LiteralPath $p)) { throw "system PowerShell not found at $p" }
+  return $p
+}
+
 # self-elevate
 $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)) {
   Write-Host "Requesting administrator rights (UAC)..." -ForegroundColor Yellow
-  Start-Process powershell.exe -Verb RunAs -ArgumentList @(
+  Start-Process (Get-SystemPowerShellPath) -Verb RunAs -ArgumentList @(
     "-ExecutionPolicy", "Bypass", "-NoProfile", "-File", "`"$($MyInvocation.MyCommand.Path)`"",
     "-InstallDir", "`"$InstallDir`"")
   return
