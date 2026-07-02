@@ -22,6 +22,7 @@ small `.exe` with no installer, no cloud, no kernel driver.
 | C2 / RCE / reverse shells | `NET.SHELL_SOCKET`, `NET.LISTEN_SUSPICIOUS_PROC`, `NET.RAW_IP_OUTBOUND`, `NET.BEACON`, `NET.IOC_MATCH` |
 | Keyloggers / hooks | `KEY.LL_HOOK`, `KEY.RAW_INPUT`, `KEY.POLL_HEURISTIC`, `KEY.INJECTED_DLL` |
 | Rootkits (cross-view) | `RK.HIDDEN_PROC`, `RK.HIDDEN_FILE`, `RK.SUSPICIOUS_DRIVER` |
+| Offline-like hunting | `OFFLINE.SNAPSHOT`, `OFFLINE.RAW_VOLUME`, `OFFLINE.DEFENDER_EXCLUSION`, `OFFLINE.BOOT_DRIVER`, `OFFLINE.RUNKEY` |
 | Correlation | `CORR.IMPLANT` (unsigned multi-signal), `CORR.MULTI_SIGNAL` |
 
 A post-scan **correlation pass** fuses multiple signals on one PID into a single
@@ -90,6 +91,9 @@ Scan modes:
   --deep             hash files / heavier checks
   --watch N          sample network for N seconds to catch C2 beaconing
   --scan-path PATH   scan a file or directory only (entropy/signing/IOC)
+  --offline-like     VSS snapshot + offline hive/boot-driver hunt, no reboot
+  --offline-passes N repeat offline-like snapshot passes (default: 2)
+  --offline-roots "A;B;C"  extra live roots to map into the snapshot and scan
 
 Integrity (Merkle file-integrity monitoring):
   --baseline                 build/update a Merkle baseline of execution-relevant
@@ -142,6 +146,9 @@ build\sentinelc.exe --quick
 :: deep sweep + 30s beacon watch, JSON to a file
 build\sentinelc.exe --full --deep --watch 30 --json > scan.json
 
+:: Defender Offline-style hunt without rebooting (run elevated)
+build\sentinelc.exe --offline-like --offline-passes 2 --json > offline-like.json
+
 :: scan a suspicious download
 build\sentinelc.exe --scan-path "C:\Users\me\Downloads\invoice.exe" --deep
 
@@ -175,10 +182,30 @@ and diffs against it:
 - A first baseline of large system roots is slow (it hashes every file); scope
   with `--integrity-roots` for fast, targeted monitoring of a project or folder.
 
+## Offline-like hunting without rebooting
+
+`--offline-like` is the closest safe no-reboot analogue to Defender Offline. It
+creates a short-lived VSS snapshot of the system volume, scans high-value paths
+through the snapshot namespace, opens raw NTFS volume metadata, and inspects
+offline registry hives copied from the snapshot. It hunts for broad Defender
+exclusions, suspicious offline Run keys, and boot/system drivers that are
+missing, unsigned/invalid, user-writable, or outside normal driver locations.
+
+Run it elevated:
+```
+build\sentinelc.exe --offline-like --offline-passes 2
+```
+
+Use `--offline-roots "C:\path\one;C:\path\two"` for broader folder sweeps. The
+default snapshot path scan is intentionally bounded to drivers, scheduled tasks,
+and startup folders so a normal run does not spend hours crawling user data.
+
 ## Notes & limitations
 - User-mode only: a kernel rootkit that lies to every user API defeats the
   cross-view checks. Drivers are inventoried and signature-checked, which catches
   the common unsigned-driver case.
+- `--offline-like` narrows the Defender Offline gap, but it cannot fully replace
+  a rebooted trusted scanner because the current Windows kernel is still active.
 - First run is slower (it verifies signatures for every process/service);
   results are cached within a run.
 - This is a dual-use security tool. Use it on systems you are authorized to
