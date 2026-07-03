@@ -42,32 +42,28 @@ the remaining plan does not describe stale work.
 - `scan_persist.c` scheduled-task parsing sanitizes comments/CDATA, understands
   namespaces/attributes, scans each Exec action independently, decodes common
   XML entities, and emits ComHandler actions.
+- `sign.c` has an in-process signature cache and a persistent
+  `%ProgramData%\SentinelC\cache\sign_cache.tsv` cache. Persisted entries are
+  accepted only after SHA-256 content verification, so path/mtime/size reuse
+  does not suppress a changed file.
+- `pe.c` memoizes `pe_analyze` results in-process by path, size, and mtime,
+  avoiding repeated PE mapping and import parsing within one scan.
 
 ## Remaining Highest-Value Work
 
-1. **Persistent signature cache.**
-   The in-process signature cache exists, but cold scans still reverify every
-   file. Add `%ProgramData%\SentinelC\sign_cache.tsv` keyed by path, size, and
-   mtime.
-
-2. **PE analysis cache.**
-   Cache `pe_analyze` by path, size, and mtime and stash `PeInfo` on `ProcRec`
-   so process, keylogger, service, file, and correlation paths do not repeat the
-   same PE parse work.
-
-3. **Parallel FIM hashing.**
+1. **Parallel FIM hashing.**
    `scan_integrity.c` correctly streams every tracked file now. Add a producer
    plus worker pool after making `list_add` thread-safe.
 
-4. **Full YARA engine or larger supported subset.**
+2. **Full YARA engine or larger supported subset.**
    The current `yara_lite.c` is useful but not libyara. Decide whether to embed
    libyara or clearly define the supported subset and add tests for it.
 
-5. **Code signing and release hardening.**
+3. **Code signing and release hardening.**
    Production distribution needs a signed binary and installer so SmartScreen
    and AV reputation do not dominate first-run trust.
 
-6. **Kernel-driver design remains future work.**
+4. **Kernel-driver design remains future work.**
    A signed driver is still the only honest way to get kernel-vantage rootkit
    visibility and blocking. It requires WDK/MSVC, signing, and a different
    release process.
@@ -76,9 +72,9 @@ the remaining plan does not describe stale work.
 
 - Correctness currently wins over speed for FIM: integrity checks intentionally
   rehash content every run to catch timestomped or metadata-preserving changes.
-- Full scans now include memory, credential, and evasion checks. Performance
-  work should focus on avoiding repeated PE/signature work rather than weakening
-  detection defaults.
+- Full scans now include memory, credential, and evasion checks. Remaining
+  performance work should focus on parallelizing heavyweight walks and measuring
+  cache hit rates without weakening detection defaults.
 
 ## Documentation Rule
 

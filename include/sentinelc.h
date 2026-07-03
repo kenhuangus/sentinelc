@@ -230,8 +230,10 @@ typedef enum {
 } SignVerdict;
 
 const char *sign_name(SignVerdict v);            /* util.c */
-/* Verify a file's signature (embedded + catalog). Result cached by path+mtime.
- * signer_out (may be NULL) receives the signer subject (<= SC_NAME_LEN). */
+/* Verify a file's signature (embedded + catalog). Results are cached
+ * in-process by path+size+mtime, and persisted with a SHA-256 content key when
+ * the ProgramData cache directory can be secured. signer_out (may be NULL)
+ * receives the signer subject (<= SC_NAME_LEN). */
 SignVerdict sign_verify(const char *path, char *signer_out, size_t signer_cap);
 void        sign_cache_init(void);
 void        sign_cache_free(void);

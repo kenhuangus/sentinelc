@@ -4,7 +4,8 @@
  * sometimes more with revocation). Scanners call it concurrently across many
  * files, often the same files repeatedly. We therefore:
  *   - disable revocation network I/O (WTD_REVOKE_NONE, cache-only state),
- *   - cache results keyed by lowercased path + last-write-time,
+ *   - cache results in-process keyed by lowercased path + size + mtime,
+ *   - persist verified results with an additional SHA-256 content key,
  *   - guard the cache with a CRITICAL_SECTION.
  *
  * Embedded verification is tried first; on TRUST_E_NOSIGNATURE we fall back to
@@ -17,17 +18,27 @@
 #include <softpub.h>
 #include <mscat.h>
 #include <wincrypt.h>
+#include <bcrypt.h>
+#include <sddl.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* ------------------------------------------------------------------ cache */
+
+#define SIGN_PERSIST_MAX_BYTES ((uint64_t)512u * 1024u * 1024u)
+#define SIGN_HASH_BLOCK        (1024u * 1024u)
 
 typedef struct {
     char        path[SC_MAX_PATH];   /* lowercased */
     FILETIME    mtime;
+    uint64_t    fsize;
+    char        sha256[65];          /* lowercase hex; optional */
     SignVerdict verdict;
     char        signer[SC_NAME_LEN];
     bool        used;
+    bool        has_sha256;
+    bool        persisted;           /* loaded from disk; require sha match */
 } SignCacheEntry;
 
 static SignCacheEntry  *g_cache = NULL;
@@ -36,6 +47,23 @@ static size_t           g_cache_cap   = 0;
 static CRITICAL_SECTION g_cache_lock;
 static INIT_ONCE        g_cache_once = INIT_ONCE_STATIC_INIT;
 static bool             g_cache_ready = false;
+static bool             g_persist_ready = false;
+static char             g_persist_path[SC_MAX_PATH];
+
+static uint64_t ft_to_u64(const FILETIME *ft)
+{
+    return ((uint64_t)ft->dwHighDateTime << 32) | (uint64_t)ft->dwLowDateTime;
+}
+
+static void u64_to_ft(uint64_t v, FILETIME *ft)
+{
+    ft->dwLowDateTime  = (DWORD)(v & 0xffffffffu);
+    ft->dwHighDateTime = (DWORD)(v >> 32);
+}
+
+static bool setup_persistent_cache_path(void);
+static void persistent_cache_load(void);
+static void persistent_cache_save(void);
 
 static BOOL CALLBACK sign_cache_init_once(PINIT_ONCE once, PVOID param,
                                           PVOID *ctx)
@@ -46,6 +74,10 @@ static BOOL CALLBACK sign_cache_init_once(PINIT_ONCE once, PVOID param,
     g_cache_count = 0;
     g_cache_cap   = 0;
     g_cache_ready = true;
+    g_persist_ready = false;
+    g_persist_path[0] = '\0';
+    if (setup_persistent_cache_path())
+        persistent_cache_load();
     return TRUE;
 }
 
@@ -61,6 +93,7 @@ void sign_cache_init(void)
 void sign_cache_free(void)
 {
     if (!g_cache_ready) return;
+    persistent_cache_save();
     EnterCriticalSection(&g_cache_lock);
     free(g_cache);
     g_cache       = NULL;
@@ -69,6 +102,8 @@ void sign_cache_free(void)
     LeaveCriticalSection(&g_cache_lock);
     DeleteCriticalSection(&g_cache_lock);
     g_cache_ready = false;
+    g_persist_ready = false;
+    g_persist_path[0] = '\0';
     /* Reset the one-time guard so a later sign_cache_init() re-initializes
      * cleanly (e.g. a second scan pass within the same process). */
     {
@@ -83,14 +118,160 @@ static bool ft_equal(const FILETIME *a, const FILETIME *b)
            a->dwHighDateTime == b->dwHighDateTime;
 }
 
+static bool apply_admin_system_dacl(const char *path)
+{
+    PSECURITY_DESCRIPTOR sd = NULL;
+    bool ok = false;
+    const char *sddl = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            sddl, SDDL_REVISION_1, &sd, NULL))
+        return false;
+    ok = SetFileSecurityA(path,
+                          DACL_SECURITY_INFORMATION |
+                          PROTECTED_DACL_SECURITY_INFORMATION,
+                          sd) != 0;
+    LocalFree(sd);
+    return ok;
+}
+
+static bool ensure_dir_secure(const char *path)
+{
+    PSECURITY_DESCRIPTOR sd = NULL;
+    SECURITY_ATTRIBUTES sa;
+    bool have_sd = ConvertStringSecurityDescriptorToSecurityDescriptorA(
+        "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+        SDDL_REVISION_1, &sd, NULL) != 0;
+
+    memset(&sa, 0, sizeof sa);
+    sa.nLength = sizeof sa;
+    sa.lpSecurityDescriptor = have_sd ? sd : NULL;
+    sa.bInheritHandle = FALSE;
+
+    if (!CreateDirectoryA(path, have_sd ? &sa : NULL)) {
+        DWORD err = GetLastError();
+        if (err != ERROR_ALREADY_EXISTS) {
+            if (sd) LocalFree(sd);
+            return false;
+        }
+    }
+    if (sd) LocalFree(sd);
+    return apply_admin_system_dacl(path);
+}
+
+static bool setup_persistent_cache_path(void)
+{
+    char program_data[MAX_PATH];
+    DWORD n = GetEnvironmentVariableA("ProgramData", program_data,
+                                      sizeof program_data);
+    if (n == 0 || n >= sizeof program_data) {
+        strncpy(program_data, "C:\\ProgramData", sizeof program_data - 1);
+        program_data[sizeof program_data - 1] = '\0';
+    }
+
+    char base[SC_MAX_PATH];
+    char cache_dir[SC_MAX_PATH];
+    snprintf(base, sizeof base, "%s\\SentinelC", program_data);
+    snprintf(cache_dir, sizeof cache_dir, "%s\\cache", base);
+    if (!ensure_dir_secure(base) || !ensure_dir_secure(cache_dir))
+        return false;
+
+    snprintf(g_persist_path, sizeof g_persist_path,
+             "%s\\sign_cache.tsv", cache_dir);
+    g_persist_path[sizeof g_persist_path - 1] = '\0';
+    g_persist_ready = true;
+    return true;
+}
+
+static bool sha256_file_hex_w(const wchar_t *wpath, uint64_t fsize,
+                              char hex_out[65])
+{
+    static const char hexd[] = "0123456789abcdef";
+    bool ok = false;
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    BCRYPT_ALG_HANDLE hAlg = NULL;
+    BCRYPT_HASH_HANDLE hHash = NULL;
+    DWORD cbHashObj = 0, cb = 0;
+    PUCHAR hashObj = NULL;
+    BYTE digest[32];
+    BYTE *buf = NULL;
+
+    if (!hex_out) return false;
+    hex_out[0] = '\0';
+    if (!wpath || !wpath[0] || fsize > SIGN_PERSIST_MAX_BYTES)
+        return false;
+
+    hFile = CreateFileW(wpath, GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE)
+        return false;
+
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(
+            &hAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0)))
+        goto cleanup;
+    if (!BCRYPT_SUCCESS(BCryptGetProperty(
+            hAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&cbHashObj, sizeof cbHashObj,
+            &cb, 0)))
+        goto cleanup;
+    hashObj = (PUCHAR)malloc(cbHashObj);
+    buf = (BYTE *)malloc(SIGN_HASH_BLOCK);
+    if (!hashObj || !buf)
+        goto cleanup;
+    if (!BCRYPT_SUCCESS(BCryptCreateHash(
+            hAlg, &hHash, hashObj, cbHashObj, NULL, 0, 0)))
+        goto cleanup;
+
+    for (;;) {
+        DWORD rd = 0;
+        if (!ReadFile(hFile, buf, SIGN_HASH_BLOCK, &rd, NULL))
+            goto cleanup;
+        if (rd == 0)
+            break;
+        if (!BCRYPT_SUCCESS(BCryptHashData(hHash, buf, rd, 0)))
+            goto cleanup;
+    }
+    if (!BCRYPT_SUCCESS(BCryptFinishHash(hHash, digest, sizeof digest, 0)))
+        goto cleanup;
+
+    for (size_t i = 0; i < sizeof digest; i++) {
+        hex_out[i * 2]     = hexd[digest[i] >> 4];
+        hex_out[i * 2 + 1] = hexd[digest[i] & 0x0f];
+    }
+    hex_out[64] = '\0';
+    ok = true;
+
+cleanup:
+    free(buf);
+    free(hashObj);
+    if (hHash) BCryptDestroyHash(hHash);
+    if (hAlg)  BCryptCloseAlgorithmProvider(hAlg, 0);
+    if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+    return ok;
+}
+
+static bool clean_cache_text(char *s)
+{
+    if (!s) return false;
+    for (; *s; s++) {
+        unsigned char ch = (unsigned char)*s;
+        if (ch == '\t' || ch == '\r' || ch == '\n')
+            *s = ' ';
+        else if (ch < 0x20)
+            *s = ' ';
+    }
+    return true;
+}
+
 /* Look up a cached verdict. Returns true on hit and fills *out / signer. */
-static bool cache_get(const char *lpath, const FILETIME *mtime,
-                      SignVerdict *out, char *signer_out, size_t signer_cap)
+static bool cache_get_fast(const char *lpath, const FILETIME *mtime,
+                           uint64_t fsize, SignVerdict *out,
+                           char *signer_out, size_t signer_cap)
 {
     bool hit = false;
     EnterCriticalSection(&g_cache_lock);
     for (size_t i = 0; i < g_cache_count; i++) {
         if (g_cache[i].used && ft_equal(&g_cache[i].mtime, mtime) &&
+            g_cache[i].fsize == fsize && !g_cache[i].persisted &&
             strcmp(g_cache[i].path, lpath) == 0) {
             *out = g_cache[i].verdict;
             if (signer_out && signer_cap > 0) {
@@ -105,16 +286,73 @@ static bool cache_get(const char *lpath, const FILETIME *mtime,
     return hit;
 }
 
-static void cache_put(const char *lpath, const FILETIME *mtime,
-                      SignVerdict v, const char *signer)
+static bool cache_has_persistent_candidate(const char *lpath,
+                                           const FILETIME *mtime,
+                                           uint64_t fsize)
+{
+    bool found = false;
+    EnterCriticalSection(&g_cache_lock);
+    for (size_t i = 0; i < g_cache_count; i++) {
+        if (g_cache[i].used && g_cache[i].persisted &&
+            g_cache[i].has_sha256 && g_cache[i].fsize == fsize &&
+            ft_equal(&g_cache[i].mtime, mtime) &&
+            strcmp(g_cache[i].path, lpath) == 0) {
+            found = true;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_cache_lock);
+    return found;
+}
+
+static bool cache_get_persistent(const char *lpath, const FILETIME *mtime,
+                                 uint64_t fsize, const char sha256[65],
+                                 SignVerdict *out,
+                                 char *signer_out, size_t signer_cap)
+{
+    bool hit = false;
+    EnterCriticalSection(&g_cache_lock);
+    for (size_t i = 0; i < g_cache_count; i++) {
+        if (g_cache[i].used && g_cache[i].persisted &&
+            g_cache[i].has_sha256 && g_cache[i].fsize == fsize &&
+            ft_equal(&g_cache[i].mtime, mtime) &&
+            strcmp(g_cache[i].path, lpath) == 0 &&
+            strcmp(g_cache[i].sha256, sha256) == 0) {
+            *out = g_cache[i].verdict;
+            if (signer_out && signer_cap > 0) {
+                strncpy(signer_out, g_cache[i].signer, signer_cap - 1);
+                signer_out[signer_cap - 1] = '\0';
+            }
+            g_cache[i].persisted = false; /* next hit this run is fast */
+            hit = true;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_cache_lock);
+    return hit;
+}
+
+static void cache_put_ex(const char *lpath, const FILETIME *mtime,
+                         uint64_t fsize, const char sha256[65],
+                         SignVerdict v, const char *signer, bool persisted)
 {
     EnterCriticalSection(&g_cache_lock);
 
-    /* If an entry for this path exists (stale mtime), update it in place. */
+    /* If an entry for this path exists (stale metadata), update it in place. */
     for (size_t i = 0; i < g_cache_count; i++) {
         if (g_cache[i].used && strcmp(g_cache[i].path, lpath) == 0) {
             g_cache[i].mtime   = *mtime;
+            g_cache[i].fsize   = fsize;
             g_cache[i].verdict = v;
+            g_cache[i].has_sha256 = false;
+            g_cache[i].sha256[0] = '\0';
+            if (sha256 && sha256[0]) {
+                strncpy(g_cache[i].sha256, sha256,
+                        sizeof g_cache[i].sha256 - 1);
+                g_cache[i].sha256[sizeof g_cache[i].sha256 - 1] = '\0';
+                g_cache[i].has_sha256 = true;
+            }
+            g_cache[i].persisted = persisted;
             g_cache[i].signer[0] = '\0';
             if (signer) {
                 strncpy(g_cache[i].signer, signer, sizeof g_cache[i].signer - 1);
@@ -142,6 +380,12 @@ static void cache_put(const char *lpath, const FILETIME *mtime,
         e->path[n] = '\0';
     }
     e->mtime   = *mtime;
+    e->fsize   = fsize;
+    if (sha256 && sha256[0]) {
+        strncpy(e->sha256, sha256, sizeof e->sha256 - 1);
+        e->sha256[sizeof e->sha256 - 1] = '\0';
+        e->has_sha256 = true;
+    }
     e->verdict = v;
     if (signer) {
         size_t n = strlen(signer);
@@ -150,8 +394,162 @@ static void cache_put(const char *lpath, const FILETIME *mtime,
         e->signer[n] = '\0';
     }
     e->used = true;
+    e->persisted = persisted;
 
     LeaveCriticalSection(&g_cache_lock);
+}
+
+static bool valid_sha256_hex(const char *s)
+{
+    if (!s || strlen(s) != 64)
+        return false;
+    for (size_t i = 0; i < 64; i++) {
+        char ch = s[i];
+        if (!((ch >= '0' && ch <= '9') ||
+              (ch >= 'a' && ch <= 'f') ||
+              (ch >= 'A' && ch <= 'F')))
+            return false;
+    }
+    return true;
+}
+
+static void lower_hex(char *s)
+{
+    for (; s && *s; s++) {
+        if (*s >= 'A' && *s <= 'F')
+            *s = (char)(*s - 'A' + 'a');
+    }
+}
+
+static char *split_tab(char **cursor)
+{
+    char *s = *cursor;
+    if (!s) return NULL;
+    char *tab = strchr(s, '\t');
+    if (tab) {
+        *tab = '\0';
+        *cursor = tab + 1;
+    } else {
+        *cursor = s + strlen(s);
+    }
+    return s;
+}
+
+static void persistent_cache_load(void)
+{
+    if (!g_persist_ready || !g_persist_path[0])
+        return;
+
+    FILE *f = fopen(g_persist_path, "rb");
+    if (!f)
+        return;
+
+    char line[SC_MAX_PATH + SC_NAME_LEN + 256];
+    if (!fgets(line, sizeof line, f)) {
+        fclose(f);
+        return;
+    }
+    if (strncmp(line, "sentinelc-sign-cache-v2", 23) != 0) {
+        fclose(f);
+        return;
+    }
+
+    while (fgets(line, sizeof line, f)) {
+        line[sizeof line - 1] = '\0';
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0' || line[0] == '#')
+            continue;
+
+        char *p = line;
+        char *sha = split_tab(&p);
+        char *size_s = split_tab(&p);
+        char *mtime_s = split_tab(&p);
+        char *verdict_s = split_tab(&p);
+        char *signer = split_tab(&p);
+        char *path = p;
+        if (!sha || !size_s || !mtime_s || !verdict_s || !signer ||
+            !path || !path[0])
+            continue;
+        if (!valid_sha256_hex(sha))
+            continue;
+        lower_hex(sha);
+
+        char *end = NULL;
+        unsigned long long fsize = strtoull(size_s, &end, 10);
+        if (!end || *end) continue;
+        end = NULL;
+        unsigned long long mtime64 = strtoull(mtime_s, &end, 10);
+        if (!end || *end) continue;
+        long v = strtol(verdict_s, &end, 10);
+        if (!end || *end) continue;
+        if (v <= SIGN_UNKNOWN || v > SIGN_SIGNED_MS)
+            continue;
+
+        str_lower(path);
+        FILETIME ft;
+        u64_to_ft((uint64_t)mtime64, &ft);
+        cache_put_ex(path, &ft, (uint64_t)fsize, sha, (SignVerdict)v,
+                     signer, true);
+    }
+
+    fclose(f);
+}
+
+static void persistent_cache_save(void)
+{
+    if (!g_persist_ready || !g_persist_path[0] || !g_cache_ready)
+        return;
+
+    char tmp[SC_MAX_PATH];
+    snprintf(tmp, sizeof tmp, "%s.%lu.tmp", g_persist_path,
+             (unsigned long)GetCurrentProcessId());
+    tmp[sizeof tmp - 1] = '\0';
+
+    FILE *f = fopen(tmp, "wb");
+    if (!f)
+        return;
+
+    fprintf(f, "sentinelc-sign-cache-v2\n");
+
+    EnterCriticalSection(&g_cache_lock);
+    for (size_t i = 0; i < g_cache_count; i++) {
+        SignCacheEntry *e = &g_cache[i];
+        if (!e->used || !e->has_sha256 || e->verdict == SIGN_UNKNOWN)
+            continue;
+        if (!valid_sha256_hex(e->sha256))
+            continue;
+
+        char signer[SC_NAME_LEN];
+        char path[SC_MAX_PATH];
+        strncpy(signer, e->signer, sizeof signer - 1);
+        signer[sizeof signer - 1] = '\0';
+        strncpy(path, e->path, sizeof path - 1);
+        path[sizeof path - 1] = '\0';
+        clean_cache_text(signer);
+        clean_cache_text(path);
+
+        fprintf(f, "%s\t%llu\t%llu\t%d\t%s\t%s\n",
+                e->sha256,
+                (unsigned long long)e->fsize,
+                (unsigned long long)ft_to_u64(&e->mtime),
+                (int)e->verdict,
+                signer,
+                path);
+    }
+    LeaveCriticalSection(&g_cache_lock);
+
+    if (fclose(f) != 0) {
+        DeleteFileA(tmp);
+        return;
+    }
+
+    apply_admin_system_dacl(tmp);
+    if (!MoveFileExA(tmp, g_persist_path,
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileA(tmp);
+        return;
+    }
+    apply_admin_system_dacl(g_persist_path);
 }
 
 /* --------------------------------------------------------------- signer name */
@@ -367,11 +765,22 @@ SignVerdict sign_verify(const char *path, char *signer_out, size_t signer_cap)
     if (!path || path[0] == '\0') return SIGN_UNKNOWN;
     if (!g_cache_ready) sign_cache_init();   /* tolerate missing init */
 
-    /* mtime + lowercased key. */
+    wchar_t wpath[SC_MAX_PATH * 2];
+    if (utf8_to_wide(path, wpath, sizeof wpath / sizeof wpath[0]) == 0)
+        return SIGN_UNKNOWN;
+
+    /* Metadata + lowercased key. Persistent cache hits also require SHA-256. */
     WIN32_FILE_ATTRIBUTE_DATA fad;
     FILETIME mtime = {0, 0};
-    if (GetFileAttributesExA(path, GetFileExInfoStandard, &fad))
+    uint64_t fsize = 0;
+    bool have_meta = false;
+    if (GetFileAttributesExW(wpath, GetFileExInfoStandard, &fad) &&
+        !(fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
         mtime = fad.ftLastWriteTime;
+        fsize = ((uint64_t)fad.nFileSizeHigh << 32) |
+                (uint64_t)fad.nFileSizeLow;
+        have_meta = true;
+    }
 
     char lpath[SC_MAX_PATH];
     strncpy(lpath, path, sizeof lpath - 1);
@@ -379,12 +788,16 @@ SignVerdict sign_verify(const char *path, char *signer_out, size_t signer_cap)
     str_lower(lpath);
 
     SignVerdict cached;
-    if (cache_get(lpath, &mtime, &cached, signer_out, signer_cap))
+    if (cache_get_fast(lpath, &mtime, fsize, &cached, signer_out, signer_cap))
         return cached;
 
-    wchar_t wpath[SC_MAX_PATH * 2];
-    if (utf8_to_wide(path, wpath, sizeof wpath / sizeof wpath[0]) == 0)
-        return SIGN_UNKNOWN;
+    char sha256[65] = "";
+    if (have_meta && g_persist_ready &&
+        cache_has_persistent_candidate(lpath, &mtime, fsize) &&
+        sha256_file_hex_w(wpath, fsize, sha256) &&
+        cache_get_persistent(lpath, &mtime, fsize, sha256, &cached,
+                             signer_out, signer_cap))
+        return cached;
 
     char signer[SC_NAME_LEN] = {0};
     SignVerdict verdict;
@@ -428,7 +841,11 @@ SignVerdict sign_verify(const char *path, char *signer_out, size_t signer_cap)
             verdict = SIGN_INVALID;
     }
 
-    cache_put(lpath, &mtime, verdict, signer);
+    if (have_meta && g_persist_ready && verdict != SIGN_UNKNOWN &&
+        sha256[0] == '\0')
+        sha256_file_hex_w(wpath, fsize, sha256);
+
+    cache_put_ex(lpath, &mtime, fsize, sha256, verdict, signer, false);
 
     if (signer_out && signer_cap > 0) {
         strncpy(signer_out, signer, signer_cap - 1);

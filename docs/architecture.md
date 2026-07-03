@@ -97,6 +97,17 @@ quarantine. Important safety properties:
   reparse points/directories, creates a SYSTEM/Admin-only quarantine directory,
   moves by handle, and uses copy/delete fallback for cross-volume moves.
 
+## Caching Model
+
+- `sign.c` keeps an in-process Authenticode/catalog verdict cache by
+  lowercased path, file size, and last-write time. When it can secure
+  `%ProgramData%\SentinelC\cache`, it also persists verdicts to
+  `sign_cache.tsv`; disk-loaded entries are trusted only after the file's
+  SHA-256 matches the cached content key.
+- `pe.c` keeps an in-process `pe_analyze` result cache by lowercased path, file
+  size, and last-write time so process, keylogger, service, file, and
+  correlation paths do not repeatedly map and parse the same image in one scan.
+
 ## Fleet Console And Endpoint Agent
 
 `fleet-console/server.js` is a zero-dependency Node.js dashboard. Read APIs use a
