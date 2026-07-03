@@ -134,6 +134,11 @@ static void render_json(const FindingBus *b, const ScanCtx *c, size_t *idx)
     json_escape((c && c->limitations[0]) ? c->limitations : "", esc, sizeof(esc));
     printf("  \"limitations\": \"%s\",\n", esc);
 
+    SignCacheStats sign_stats;
+    PeCacheStats pe_stats;
+    sign_cache_stats(&sign_stats);
+    pe_cache_stats(&pe_stats);
+
     printf("  \"summary\": {\n");
     printf("    \"total\": %lu,\n", (unsigned long)b->count);
     printf("    \"crit\": %lu,\n", (unsigned long)counts[SEV_CRIT]);
@@ -141,6 +146,36 @@ static void render_json(const FindingBus *b, const ScanCtx *c, size_t *idx)
     printf("    \"med\": %lu,\n",  (unsigned long)counts[SEV_MED]);
     printf("    \"low\": %lu,\n",  (unsigned long)counts[SEV_LOW]);
     printf("    \"info\": %lu\n",  (unsigned long)counts[SEV_INFO]);
+    printf("  },\n");
+    printf("  \"cache\": {\n");
+    printf("    \"signature\": {\n");
+    printf("      \"calls\": %llu,\n",
+           (unsigned long long)sign_stats.calls);
+    printf("      \"memory_hits\": %llu,\n",
+           (unsigned long long)sign_stats.memory_hits);
+    printf("      \"persistent_hits\": %llu,\n",
+           (unsigned long long)sign_stats.persistent_hits);
+    printf("      \"verifications\": %llu,\n",
+           (unsigned long long)sign_stats.verifications);
+    printf("      \"persistent_hash_checks\": %llu,\n",
+           (unsigned long long)sign_stats.persistent_hash_checks);
+    printf("      \"persistent_entries_loaded\": %llu,\n",
+           (unsigned long long)sign_stats.persistent_entries_loaded);
+    printf("      \"persistent_entries_saved\": %llu,\n",
+           (unsigned long long)sign_stats.persistent_entries_saved);
+    printf("      \"entries\": %llu,\n",
+           (unsigned long long)sign_stats.entries);
+    printf("      \"persistent_enabled\": %s\n",
+           sign_stats.persistent_enabled ? "true" : "false");
+    printf("    },\n");
+    printf("    \"pe\": {\n");
+    printf("      \"calls\": %llu,\n", (unsigned long long)pe_stats.calls);
+    printf("      \"hits\": %llu,\n", (unsigned long long)pe_stats.hits);
+    printf("      \"misses\": %llu,\n", (unsigned long long)pe_stats.misses);
+    printf("      \"stores\": %llu,\n", (unsigned long long)pe_stats.stores);
+    printf("      \"entries\": %llu,\n", (unsigned long long)pe_stats.entries);
+    printf("      \"enabled\": %s\n", pe_stats.enabled ? "true" : "false");
+    printf("    }\n");
     printf("  }\n");
     printf("}\n");
 }

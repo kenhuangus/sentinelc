@@ -5,16 +5,16 @@
 .DESCRIPTION
   Runs ..\build\sentinelc.exe --full --json, captures stdout, wraps it in the
   ingest envelope { hostname, scannedAt, scan }, and POSTs it to the console's
-  /api/ingest endpoint with a bearer token.
+  /api/ingest endpoint with a per-host bearer token.
 
 .PARAMETER ConsoleUrl
   Base URL of the Fleet Console. Default http://127.0.0.1:8787
 
 .PARAMETER Token
-  Bearer token. Defaults to the SENTINELC_FLEET_TOKEN environment variable.
+  Per-host ingest bearer token. Defaults to the SENTINELC_FLEET_TOKEN environment variable.
 
 .EXAMPLE
-  .\submit.ps1 -ConsoleUrl http://127.0.0.1:8787 -Token <token>
+  .\submit.ps1 -ConsoleUrl http://127.0.0.1:8787 -Token <this-host-ingest-token>
 #>
 [CmdletBinding()]
 param(
@@ -24,10 +24,23 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Assert-SafeConsoleUrl {
+  param([Parameter(Mandatory = $true)][string]$Url)
+  try {
+    $uri = [Uri]$Url
+  } catch {
+    throw "ConsoleUrl is not a valid URI: $Url"
+  }
+  if ($uri.Scheme -eq 'https') { return }
+  if ($uri.Scheme -eq 'http' -and $uri.IsLoopback) { return }
+  throw "Refusing to send the host ingest token over non-loopback plaintext HTTP. Use https:// or http://127.0.0.1 for local-only testing."
+}
+
 if ([string]::IsNullOrWhiteSpace($Token)) {
   Write-Error "No token supplied. Pass -Token or set SENTINELC_FLEET_TOKEN."
   exit 1
 }
+Assert-SafeConsoleUrl -Url $ConsoleUrl
 
 # Locate the scanner relative to this script.
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path

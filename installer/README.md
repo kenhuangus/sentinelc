@@ -17,7 +17,7 @@ From the repo (one UAC prompt when it self-elevates):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File installer\install.ps1 `
-  -ConsoleUrl https://your-console.example.com -Token <fleet-token>
+  -ConsoleUrl https://your-console.example.com -Token <this-host-ingest-token>
 ```
 
 Options:
@@ -25,7 +25,7 @@ Options:
 | Flag | Default | Meaning |
 |---|---|---|
 | `-ConsoleUrl` | (required) | Fleet Console base URL |
-| `-Token` | (required) | Ingest bearer token |
+| `-Token` | (required) | Per-host Fleet Console ingest bearer token |
 | `-InstallDir` | `C:\Program Files\SentinelC` | Install location |
 | `-SourceDir` | `..\build` | Where `sentinelc.exe` + `rules\` live |
 | `-DailyAt` | `03:00` | Daily scan time |
@@ -37,7 +37,7 @@ Options:
 1. Copies `sentinelc.exe`, `rules\`, and the agent scripts to `InstallDir`.
 2. ACL-locks the dir: **SYSTEM/Admins full, Users read-only** (the exe can't be
    tampered with by a standard user).
-3. Writes `config.json` with the console URL and a **DPAPI-encrypted token**
+3. Writes `config.json` with the console URL and a **DPAPI-encrypted host token**
    (`LocalMachine` scope — only this machine can decrypt it). The file is
    readable only by SYSTEM/Admins.
 4. Registers scheduled task `\SentinelC\FullScan`, running as **SYSTEM with
@@ -73,4 +73,7 @@ powershell -ExecutionPolicy Bypass -File "C:\Program Files\SentinelC\uninstall.p
 - **Code-sign `sentinelc.exe` and the installer** (OV/EV cert). Then UAC shows
   *"Verified publisher: <you>"* instead of "Unknown publisher", and SmartScreen
   stops blocking downloads. This is the single biggest trust factor.
-- Serve the Fleet Console over **HTTPS** and rotate the ingest token per tenant.
+- Serve the Fleet Console over **HTTPS** for remote endpoints. The installer and
+  upload scripts reject non-loopback plaintext HTTP.
+- Use a different ingest token per endpoint hostname and rotate tokens when a
+  machine is retired or reimaged.

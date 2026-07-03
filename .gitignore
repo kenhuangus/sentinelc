@@ -5,8 +5,10 @@
 *.obj
 *.dll
 *.lib
+__pycache__/
+*.pyc
 
-# Local baselines / system inventories — NEVER commit (contain host file paths)
+# Local baselines / system inventories - NEVER commit host-specific paths
 *.tsv
 baseline*
 
@@ -20,3 +22,5 @@ baseline*
 .DS_Store
 Thumbs.db
 .gstack/
+.codegraph/
+.cursor/

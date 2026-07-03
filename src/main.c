@@ -47,10 +47,13 @@ static void print_help(const char *argv0)
         "\n"
         "Scan modes:\n"
         "  --quick            Fast subset: process, service, persist, network (default)\n"
-        "  --full             All scanners (adds keylog, rootkit)\n"
+        "  --full             All live scanners (adds keylog, rootkit, creds, memory, evasion)\n"
         "  --deep             Hash files / heavier checks\n"
         "  --watch N          Network beacon sampling window of N seconds\n"
         "  --scan-path PATH   Targeted file/directory scan (skips live scanners)\n"
+        "  --offline-like     VSS snapshot + offline registry/boot-driver hunt, no reboot\n"
+        "  --offline-passes N Repeat offline-like hunting passes (default: 2)\n"
+        "  --offline-roots \"A;B;C\"  Extra live roots to map into the snapshot\n"
         "\n"
         "Output:\n"
         "  --json             Emit JSON\n"
@@ -156,6 +159,12 @@ static int parse_cli(int argc, char **argv, Config *cfg)
             cfg->integrity_check = true;
             continue;
         }
+        if (strcmp(a, "--offline-like") == 0) {
+            cfg->offline_like = true;
+            cfg->full = true;
+            cfg->quick = false;
+            continue;
+        }
         if (strcmp(a, "--integrity-roots") == 0) {
             if (i + 1 >= argc) { fprintf(stderr, "--integrity-roots requires a semicolon list\n"); return 2; }
             copy_arg(cfg->integrity_roots, sizeof(cfg->integrity_roots), argv[++i]);
@@ -177,6 +186,28 @@ static int parse_cli(int argc, char **argv, Config *cfg)
                 return 2;
             }
             cfg->watch_secs = (int)v;
+            continue;
+        }
+        if (strcmp(a, "--offline-passes") == 0) {
+            if (i + 1 >= argc) { fprintf(stderr, "--offline-passes requires a count\n"); return 2; }
+            char *end = NULL;
+            long v = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || v < 1 || v > 10) {
+                fprintf(stderr, "--offline-passes: use a count from 1 to 10\n");
+                return 2;
+            }
+            cfg->offline_passes = (int)v;
+            cfg->offline_like = true;
+            cfg->full = true;
+            cfg->quick = false;
+            continue;
+        }
+        if (strcmp(a, "--offline-roots") == 0) {
+            if (i + 1 >= argc) { fprintf(stderr, "--offline-roots requires a semicolon list\n"); return 2; }
+            copy_arg(cfg->offline_roots, sizeof(cfg->offline_roots), argv[++i]);
+            cfg->offline_like = true;
+            cfg->full = true;
+            cfg->quick = false;
             continue;
         }
         if (strcmp(a, "--scan-path") == 0) {
@@ -243,6 +274,8 @@ static int parse_cli(int argc, char **argv, Config *cfg)
     /* default scan mode: quick (unless full was requested) */
     if (!cfg->quick && !cfg->full)
         cfg->quick = true;
+    if (cfg->offline_like && cfg->offline_passes <= 0)
+        cfg->offline_passes = 2;
 
     return 0;
 }
@@ -519,6 +552,18 @@ int main(int argc, char **argv)
             fns[n] = scan_evade;   names[n] = "amsi/etw";  n++;
         }
         run_scanners_parallel(&ctx, fns, names, n);
+
+        if (cfg.offline_like) {
+            phase_line("  offline-like snapshot hunt...");
+            ULONGLONG o0 = GetTickCount64();
+            scan_offline_like(&ctx);
+            {
+                char d[80];
+                snprintf(d, sizeof d, "  offline-like hunt done (%us).",
+                         (unsigned)((GetTickCount64() - o0) / 1000));
+                phase_done_line(d);
+            }
+        }
     }
 
     /* ---- correlate, suppress false positives, report, respond ---- */

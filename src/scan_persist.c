@@ -340,6 +340,41 @@ static bool read_reg_sz(HKEY root, const char *subkey, const char *value,
     return true;
 }
 
+static const char *root_label(HKEY root)
+{
+    if (root == HKEY_LOCAL_MACHINE) return "HKLM";
+    if (root == HKEY_CURRENT_USER)  return "HKCU";
+    return "HK?";
+}
+
+static bool read_reg_dword(HKEY root, const char *subkey, const char *value,
+                           DWORD *out)
+{
+    if (out) *out = 0;
+    HKEY hk;
+    if (RegOpenKeyExA(root, subkey, 0, KEY_READ | KEY_QUERY_VALUE, &hk)
+        != ERROR_SUCCESS)
+        return false;
+    DWORD data = 0, dlen = sizeof data, type = 0;
+    LONG e = RegQueryValueExA(hk, value, NULL, &type, (BYTE *)&data, &dlen);
+    RegCloseKey(hk);
+    if (e != ERROR_SUCCESS || type != REG_DWORD || dlen != sizeof data)
+        return false;
+    if (out) *out = data;
+    return true;
+}
+
+static bool reg_key_exists(HKEY root, const char *subkey)
+{
+    HKEY hk;
+    LONG e = RegOpenKeyExA(root, subkey, 0, KEY_READ, &hk);
+    if (e == ERROR_SUCCESS) {
+        RegCloseKey(hk);
+        return true;
+    }
+    return false;
+}
+
 static void scan_winlogon(ScanCtx *c)
 {
     static const char *WL =
@@ -989,90 +1024,326 @@ static void xml_sanitize(const char *xml, char *out, size_t cap)
     out[o] = '\0';
 }
 
-/* Pull the text of the first <tag ...> ... </tag> from an already-sanitized
- * UTF-8 XML buffer. Tolerates:
- *   - attributes on the open tag:   <Command xml:space="preserve">
- *   - an optional namespace prefix: <ns:Command>
- *   - whitespace around the value (trimmed)
- * Returns true if found (non-empty trimmed value written to out). Bounded and
- * safe on malformed/truncated input. */
-static bool xml_find_open(const char *xml, const char *tag, const char **body)
+static int xml_hexval(char ch)
 {
-    size_t tlen = strlen(tag);
-    const char *p = xml;
-    while ((p = strchr(p, '<')) != NULL) {
-        const char *q = p + 1;
-        /* optional namespace prefix: skip "<prefix:" */
-        const char *name = q;
-        const char *colon = NULL;
-        for (const char *r = q; *r && *r != '>' && *r != ' ' &&
-                                 *r != '\t' && *r != '\r' && *r != '\n'; r++) {
-            if (*r == ':') colon = r;
-        }
-        if (colon) name = colon + 1;
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return 10 + (ch - 'a');
+    if (ch >= 'A' && ch <= 'F') return 10 + (ch - 'A');
+    return -1;
+}
 
-        if (strncmp(name, tag, tlen) == 0) {
-            char after = name[tlen];
-            /* the char after the tag name must end the name: '>' closes the
-             * tag, whitespace introduces attributes, '/' is a self-close. */
-            if (after == '>' || after == ' ' || after == '\t' ||
-                after == '\r' || after == '\n' || after == '/') {
-                /* scan to the closing '>' of this open tag */
-                const char *gt = strchr(name + tlen, '>');
-                if (!gt) return false;          /* truncated open tag */
-                if (gt[-1] == '/') {            /* <Command/> -- empty */
-                    p = gt + 1;
+static void xml_unescape_inplace(char *s)
+{
+    char *r = s;
+    char *w = s;
+    while (*r) {
+        if (*r == '&') {
+            if (strncmp(r, "&amp;", 5) == 0)   { *w++ = '&';  r += 5; continue; }
+            if (strncmp(r, "&lt;", 4) == 0)    { *w++ = '<';  r += 4; continue; }
+            if (strncmp(r, "&gt;", 4) == 0)    { *w++ = '>';  r += 4; continue; }
+            if (strncmp(r, "&quot;", 6) == 0)  { *w++ = '"';  r += 6; continue; }
+            if (strncmp(r, "&apos;", 6) == 0)  { *w++ = '\''; r += 6; continue; }
+            if (r[1] == '#') {
+                const char *p = r + 2;
+                bool hex = false;
+                unsigned long val = 0;
+                int digits = 0;
+                if (*p == 'x' || *p == 'X') { hex = true; p++; }
+                while (*p && *p != ';') {
+                    int d = hex ? xml_hexval(*p) :
+                                  ((*p >= '0' && *p <= '9') ? *p - '0' : -1);
+                    if (d < 0) break;
+                    val = hex ? (val * 16u + (unsigned)d)
+                              : (val * 10u + (unsigned)d);
+                    digits++;
+                    p++;
+                }
+                if (*p == ';' && digits > 0 && val > 0 && val < 0x80) {
+                    *w++ = (char)val;
+                    r = (char *)(p + 1);
                     continue;
                 }
-                *body = gt + 1;
-                return true;
             }
         }
-        p = q;
+        *w++ = *r++;
+    }
+    *w = '\0';
+}
+
+static bool xml_is_name_end(char ch)
+{
+    return ch == '>' || ch == '/' || ch == ' ' || ch == '\t' ||
+           ch == '\r' || ch == '\n';
+}
+
+static bool xml_open_is_self_closing(const char *lt, const char *gt)
+{
+    const char *p = gt;
+    while (p > lt) {
+        p--;
+        if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+            continue;
+        return *p == '/';
     }
     return false;
 }
 
-static bool xml_extract(const char *xml, const char *tag,
-                        char *out, size_t cap)
+static bool xml_tag_matches_at(const char *name, const char *limit,
+                               const char *tag, size_t tlen)
 {
-    /* Sanitize first (drop comments, unwrap CDATA) so hidden/forged tags
-     * can't fool the scan and real CDATA payloads are recovered. Heap to
-     * keep the stack frame small (called per task file). */
-    char *clean = (char *)malloc(1 << 16);
-    if (!clean) return false;
-    xml_sanitize(xml, clean, 1 << 16);
-
-    const char *s = NULL;
-    if (!xml_find_open(clean, tag, &s)) { free(clean); return false; }
-
-    /* End: the matching close tag, allowing a namespace prefix.
-     * Search for "</...tag>" -- accept "</tag>" or "</ns:tag>". */
-    const char *e = NULL;
-    const char *scan = s;
-    size_t tlen = strlen(tag);
-    while ((scan = strstr(scan, "</")) != NULL) {
-        const char *n = scan + 2;
-        const char *colon = NULL;
-        for (const char *r = n; *r && *r != '>'; r++)
-            if (*r == ':') colon = r;
-        const char *nm = colon ? colon + 1 : n;
-        if (strncmp(nm, tag, tlen) == 0 &&
-            (nm[tlen] == '>' || nm[tlen] == ' ' || nm[tlen] == '\t')) {
-            e = scan;
-            break;
-        }
-        scan += 2;
+    const char *colon = NULL;
+    for (const char *r = name; r < limit && *r && !xml_is_name_end(*r); r++) {
+        if (*r == ':') colon = r;
     }
-    if (!e) { free(clean); return false; }
+    const char *nm = colon ? colon + 1 : name;
+    if ((size_t)(limit - nm) < tlen)
+        return false;
+    return strncmp(nm, tag, tlen) == 0 && xml_is_name_end(nm[tlen]);
+}
 
+static bool xml_find_open_limited(const char *start, const char *limit,
+                                  const char *tag, const char **body,
+                                  const char **after_open, bool *self_closing)
+{
+    size_t tlen = strlen(tag);
+    const char *p = start;
+    if (!limit) limit = start + strlen(start);
+
+    while (p && p < limit) {
+        p = strchr(p, '<');
+        if (!p || p >= limit) break;
+        const char *q = p + 1;
+        if (q >= limit) break;
+        if (*q == '/' || *q == '?' || *q == '!') {
+            p = q + 1;
+            continue;
+        }
+        if (xml_tag_matches_at(q, limit, tag, tlen)) {
+            const char *gt = strchr(q, '>');
+            if (!gt || gt >= limit)
+                return false;
+            bool closed = xml_open_is_self_closing(p, gt);
+            if (body) *body = closed ? gt : gt + 1;
+            if (after_open) *after_open = gt + 1;
+            if (self_closing) *self_closing = closed;
+            return true;
+        }
+        p = q + 1;
+    }
+    return false;
+}
+
+static const char *xml_find_close_limited(const char *start, const char *limit,
+                                          const char *tag)
+{
+    size_t tlen = strlen(tag);
+    const char *p = start;
+    if (!limit) limit = start + strlen(start);
+
+    while (p && p < limit) {
+        p = strstr(p, "</");
+        if (!p || p >= limit) break;
+        const char *name = p + 2;
+        if (name >= limit) break;
+        if (xml_tag_matches_at(name, limit, tag, tlen))
+            return p;
+        p = name + 1;
+    }
+    return NULL;
+}
+
+static bool xml_find_element_limited(const char *start, const char *limit,
+                                     const char *tag, const char **body,
+                                     const char **end, const char **next)
+{
+    const char *b = NULL, *after_open = NULL;
+    bool self = false;
+    if (!limit) limit = start + strlen(start);
+    if (!xml_find_open_limited(start, limit, tag, &b, &after_open, &self))
+        return false;
+    if (self) {
+        if (body) *body = b;
+        if (end) *end = b;
+        if (next) *next = after_open;
+        return true;
+    }
+    const char *e = xml_find_close_limited(b, limit, tag);
+    if (!e)
+        return false;
+    const char *gt = strchr(e, '>');
+    if (!gt || gt >= limit) gt = limit - 1;
+    if (body) *body = b;
+    if (end) *end = e;
+    if (next) *next = gt + 1;
+    return true;
+}
+
+static bool xml_extract_limited(const char *start, const char *limit,
+                                const char *tag, char *out, size_t cap)
+{
+    const char *s = NULL, *e = NULL, *next = NULL;
+    if (cap == 0) return false;
+    out[0] = '\0';
+    if (!xml_find_element_limited(start, limit, tag, &s, &e, &next))
+        return false;
     size_t len = (size_t)(e - s);
     if (len >= cap) len = cap - 1;
     memcpy(out, s, len);
     out[len] = '\0';
+    xml_unescape_inplace(out);
     trim_ws(out);
-    free(clean);
     return out[0] != '\0';
+}
+
+static void emit_task_exec(ScanCtx *c, const char *rel,
+                           const char *command, const char *args,
+                           bool have_arg)
+{
+    char target[SC_MAX_PATH];
+    extract_target(command, target, sizeof target);
+    if (target[0] == '\0') {
+        strncpy(target, command, sizeof target - 1);
+        target[sizeof target - 1] = '\0';
+    }
+    if (allowlist_match(target) || allowlist_match(rel)) return;
+
+    /* Severity bump conditions:
+     *  - command resolves into a user-writable path, OR
+     *  - command is powershell/mshta with encoded/obfuscated args. */
+    bool risky = false;
+    char reason[160]; reason[0] = '\0';
+
+    if (path_is_user_writable(target)) {
+        risky = true;
+        snprintf(reason, sizeof reason, "user-writable target");
+    }
+
+    char tlow[SC_MAX_PATH];
+    strncpy(tlow, target, sizeof tlow - 1); tlow[sizeof tlow - 1] = '\0';
+    str_lower(tlow);
+    bool is_ps    = strstr(tlow, "powershell") != NULL ||
+                    strstr(tlow, "pwsh")       != NULL;
+    bool is_mshta = strstr(tlow, "mshta")      != NULL;
+    if ((is_ps || is_mshta) && have_arg) {
+        char alow[SC_MAX_CMDLINE];
+        strncpy(alow, args, sizeof alow - 1); alow[sizeof alow - 1] = '\0';
+        str_lower(alow);
+        if (strstr(alow, "-enc") || strstr(alow, "encodedcommand") ||
+            strstr(alow, "-e ")  || strstr(alow, "frombase64") ||
+            strstr(alow, "frombase64string") ||
+            strstr(alow, "invoke-expression") ||
+            strstr(alow, "iex")  || strstr(alow, "downloadstring") ||
+            strstr(alow, "javascript:") || strstr(alow, "vbscript:")) {
+            risky = true;
+            if (reason[0])
+                snprintf(reason + strlen(reason),
+                         sizeof reason - strlen(reason),
+                         ", encoded %s", is_ps ? "powershell" : "mshta");
+            else
+                snprintf(reason, sizeof reason, "encoded %s",
+                         is_ps ? "powershell" : "mshta");
+        }
+    }
+
+    bus_emit(c->bus, "PERSIST.TASK",
+             risky ? SEV_MED : SEV_LOW,
+             risky ? 65 : 40,
+             ACT_REVIEW, 0, target,
+             "Scheduled task autostart",
+             "Task %s: Command=\"%s\"%s%s%s%s", rel, command,
+             have_arg ? " Arguments=\"" : "",
+             have_arg ? args : "",
+             have_arg ? "\"" : "",
+             reason[0] ? reason : "");
+}
+
+static bool read_com_server(HKEY root, const char *clsid,
+                            char *server, size_t scp,
+                            char *where, size_t wcap)
+{
+    static const char *leaves[] = { "InprocServer32", "LocalServer32", NULL };
+    static const char *bases[] = {
+        "Software\\Classes\\CLSID\\%s\\%s",
+        "Software\\Classes\\Wow6432Node\\CLSID\\%s\\%s",
+        NULL
+    };
+
+    for (int b = 0; bases[b]; b++) {
+        for (int l = 0; leaves[l]; l++) {
+            char sub[SC_MAX_PATH];
+            snprintf(sub, sizeof sub, bases[b], clsid, leaves[l]);
+            if (read_reg_sz(root, sub, NULL, server, scp) && server[0]) {
+                snprintf(where, wcap, "%s\\%s", root_label(root), sub);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void emit_task_comhandler(ScanCtx *c, const char *rel,
+                                 const char *clsid, const char *data)
+{
+    if (!clsid || clsid[0] == '\0') return;
+    if (allowlist_match(clsid) || allowlist_match(rel)) return;
+
+    char server[SC_MAX_CMDLINE] = "";
+    char regwhere[SC_MAX_PATH] = "";
+    HKEY server_root = NULL;
+    if (read_com_server(HKEY_CURRENT_USER, clsid, server, sizeof server,
+                        regwhere, sizeof regwhere)) {
+        server_root = HKEY_CURRENT_USER;
+    } else if (read_com_server(HKEY_LOCAL_MACHINE, clsid, server, sizeof server,
+                               regwhere, sizeof regwhere)) {
+        server_root = HKEY_LOCAL_MACHINE;
+    }
+
+    char target[SC_MAX_PATH];
+    target[0] = '\0';
+    if (server[0])
+        extract_target(server, target, sizeof target);
+    if (target[0] == '\0') {
+        strncpy(target, clsid, sizeof target - 1);
+        target[sizeof target - 1] = '\0';
+    }
+    if (allowlist_match(target)) return;
+
+    char reason[160];
+    reason[0] = '\0';
+    bool risky = false;
+    if (server_root == HKEY_CURRENT_USER) {
+        risky = true;
+        snprintf(reason, sizeof reason, "per-user COM registration");
+    }
+    if (server[0]) {
+        char why[128];
+        if (target_is_risky(target, why, sizeof why, NULL) && why[0]) {
+            risky = true;
+            if (reason[0])
+                snprintf(reason + strlen(reason),
+                         sizeof reason - strlen(reason),
+                         ", %s", why);
+            else
+                snprintf(reason, sizeof reason, "%s", why);
+        }
+    }
+
+    bus_emit(c->bus, "PERSIST.TASK_COMHANDLER",
+             risky ? SEV_MED : SEV_LOW,
+             risky ? 70 : 45,
+             ACT_REVIEW, 0, target,
+             "Scheduled task COM handler autostart",
+             "Task %s: ComHandler ClassId=\"%s\"%s%s%s%s%s%s%s%s%s",
+             rel, clsid,
+             server[0] ? " Server=\"" : "",
+             server[0] ? server : "",
+             server[0] ? "\"" : "",
+             data && data[0] ? " Data=\"" : "",
+             data && data[0] ? data : "",
+             data && data[0] ? "\"" : "",
+             reason[0] ? " [" : "",
+             reason[0] ? reason : "",
+             reason[0] ? "]" : "");
 }
 
 static void scan_task_file(ScanCtx *c, const wchar_t *fullw,
@@ -1120,67 +1391,66 @@ static void scan_task_file(ScanCtx *c, const wchar_t *fullw,
             xml = raw + 3;
     }
 
-    char command[SC_MAX_PATH];
-    char args[SC_MAX_CMDLINE];
-    bool have_cmd = xml_extract(xml, "Command", command, sizeof command);
-    bool have_arg = xml_extract(xml, "Arguments", args, sizeof args);
+    char *clean = (char *)malloc(1 << 16);
+    if (!clean) { free(raw); return; }
+    xml_sanitize(xml, clean, 1 << 16);
     free(raw);
 
-    if (!have_cmd) return;     /* nothing actionable to resolve */
+    int emitted_exec = 0;
+    const char *cursor = clean;
+    for (int guard = 0; guard < 128; guard++) {
+        const char *body = NULL, *end = NULL, *next = NULL;
+        if (!xml_find_element_limited(cursor, NULL, "Exec", &body, &end, &next))
+            break;
 
-    char target[SC_MAX_PATH];
-    extract_target(command, target, sizeof target);
-    if (target[0] == '\0') {
-        strncpy(target, command, sizeof target - 1);
-        target[sizeof target - 1] = '\0';
-    }
-    if (allowlist_match(target) || allowlist_match(rel)) return;
-
-    /* Severity bump conditions:
-     *  - command resolves into a user-writable path, OR
-     *  - command is powershell/mshta with encoded/obfuscated args. */
-    bool risky = false;
-    char reason[160]; reason[0] = '\0';
-
-    if (path_is_user_writable(target)) {
-        risky = true;
-        snprintf(reason, sizeof reason, "user-writable target");
-    }
-
-    char tlow[SC_MAX_PATH];
-    strncpy(tlow, target, sizeof tlow - 1); tlow[sizeof tlow - 1] = '\0';
-    str_lower(tlow);
-    bool is_ps   = strstr(tlow, "powershell") != NULL;
-    bool is_mshta= strstr(tlow, "mshta")      != NULL;
-    if ((is_ps || is_mshta) && have_arg) {
-        char alow[SC_MAX_CMDLINE];
-        strncpy(alow, args, sizeof alow - 1); alow[sizeof alow - 1] = '\0';
-        str_lower(alow);
-        if (strstr(alow, "-enc") || strstr(alow, "encodedcommand") ||
-            strstr(alow, "-e ")  || strstr(alow, "frombase64") ||
-            strstr(alow, "iex")  || strstr(alow, "downloadstring") ||
-            strstr(alow, "javascript:") || strstr(alow, "vbscript:")) {
-            risky = true;
-            if (reason[0])
-                snprintf(reason + strlen(reason),
-                         sizeof reason - strlen(reason),
-                         ", encoded %s", is_ps ? "powershell" : "mshta");
-            else
-                snprintf(reason, sizeof reason, "encoded %s",
-                         is_ps ? "powershell" : "mshta");
+        char command[SC_MAX_PATH];
+        char args[SC_MAX_CMDLINE];
+        bool have_cmd = xml_extract_limited(body, end, "Command",
+                                            command, sizeof command);
+        bool have_arg = xml_extract_limited(body, end, "Arguments",
+                                            args, sizeof args);
+        if (have_cmd) {
+            emit_task_exec(c, rel, command, args, have_arg);
+            emitted_exec++;
         }
+        if (!next || next <= cursor)
+            break;
+        cursor = next;
     }
 
-    bus_emit(c->bus, "PERSIST.TASK",
-             risky ? SEV_MED : SEV_LOW,
-             risky ? 65 : 40,
-             ACT_REVIEW, 0, target,
-             "Scheduled task autostart",
-             "Task %s: Command=\"%s\"%s%s%s%s", rel, command,
-             have_arg ? " Arguments=\"" : "",
-             have_arg ? args : "",
-             have_arg ? "\"" : "",
-             reason[0] ? reason : "");
+    /* Compatibility fallback for unusual task XML that has Command directly
+     * under Actions instead of an Exec wrapper. */
+    if (emitted_exec == 0) {
+        char command[SC_MAX_PATH];
+        char args[SC_MAX_CMDLINE];
+        bool have_cmd = xml_extract_limited(clean, NULL, "Command",
+                                            command, sizeof command);
+        bool have_arg = xml_extract_limited(clean, NULL, "Arguments",
+                                            args, sizeof args);
+        if (have_cmd)
+            emit_task_exec(c, rel, command, args, have_arg);
+    }
+
+    cursor = clean;
+    for (int guard = 0; guard < 128; guard++) {
+        const char *body = NULL, *end = NULL, *next = NULL;
+        if (!xml_find_element_limited(cursor, NULL, "ComHandler",
+                                      &body, &end, &next))
+            break;
+        char clsid[SC_NAME_LEN];
+        char data[SC_MAX_CMDLINE];
+        bool have_clsid = xml_extract_limited(body, end, "ClassId",
+                                              clsid, sizeof clsid);
+        bool have_data = xml_extract_limited(body, end, "Data",
+                                             data, sizeof data);
+        if (have_clsid)
+            emit_task_comhandler(c, rel, clsid, have_data ? data : "");
+        if (!next || next <= cursor)
+            break;
+        cursor = next;
+    }
+
+    free(clean);
 }
 
 static void walk_tasks(ScanCtx *c, const wchar_t *dirw, const char *relbase,
@@ -1294,7 +1564,7 @@ static int wmi_query_emit(ScanCtx *c, IWbemServices *svc, const wchar_t *wql,
         const wchar_t *props[] = { L"Name", NULL };
         const wchar_t *cmds[]  = { L"CommandLineTemplate", L"ExecutablePath",
                                    L"ScriptText", L"ScriptFileName",
-                                   L"Query", NULL };
+                                   L"Consumer", L"Filter", L"Query", NULL };
 
         for (int i = 0; props[i]; i++) {
             VARIANT v; VariantInit(&v);
@@ -1319,6 +1589,18 @@ static int wmi_query_emit(ScanCtx *c, IWbemServices *svc, const wchar_t *wql,
         if (cmdbuf[0]) extract_target(cmdbuf, target, sizeof target);
         else { strncpy(target, namebuf, sizeof target - 1);
                target[sizeof target - 1] = '\0'; }
+
+        if (_stricmp(kind, "__FilterToConsumerBinding") == 0) {
+            if (!namebuf[0] && !cmdbuf[0]) {
+                obj->lpVtbl->Release(obj);
+                continue;
+            }
+            if (str_icontains(cmdbuf, "NTEventLogEventConsumer") &&
+                str_icontains(cmdbuf, "SCM Event Log Consumer")) {
+                obj->lpVtbl->Release(obj);
+                continue;
+            }
+        }
 
         if (!allowlist_match(target)) {
             bus_emit(c->bus, "PERSIST.WMI_SUB", SEV_HIGH, 85,
@@ -1683,6 +1965,444 @@ static void scan_svc_registry(ScanCtx *c)
 }
 
 /* ------------------------------------------------------------------ *
+ *  Security-control tamper and high-value policy persistence
+ * ------------------------------------------------------------------ *
+ *
+ * Modern intrusions frequently try to make the host easier to reinfect or
+ * harder to investigate: disable Defender/Firewall, create broad Defender
+ * exclusions, force browser extensions, or steer traffic through a proxy/PAC.
+ * These are not always malware by themselves, so every finding is ACT_REVIEW.
+ */
+
+static void emit_dword_when(ScanCtx *c, const char *rule, Severity sev,
+                            int conf, HKEY root, const char *subkey,
+                            const char *value, DWORD bad_value,
+                            const char *title, const char *why)
+{
+    DWORD got = 0;
+    if (!read_reg_dword(root, subkey, value, &got))
+        return;
+    if (got != bad_value)
+        return;
+
+    char target[SC_MAX_PATH];
+    snprintf(target, sizeof target, "%s\\%s\\%s",
+             root_label(root), subkey, value);
+    bus_emit(c->bus, rule, sev, conf, ACT_REVIEW, 0, target,
+             title, "%s %s\\%s %s=%lu", why, root_label(root), subkey,
+             value, (unsigned long)got);
+}
+
+static void scan_defender_policy_tamper(ScanCtx *c)
+{
+    static const char *WD =
+        "Software\\Policies\\Microsoft\\Windows Defender";
+    static const char *RTP =
+        "Software\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection";
+    static const char *SPYNET =
+        "Software\\Policies\\Microsoft\\Windows Defender\\Spynet";
+    static const char *FEATURES =
+        "Software\\Microsoft\\Windows Defender\\Features";
+
+    emit_dword_when(c, "TAMPER.DEFENDER_DISABLED", SEV_CRIT, 92,
+        HKEY_LOCAL_MACHINE, WD, "DisableAntiSpyware", 1,
+        "Microsoft Defender disabled by policy",
+        "Defender anti-spyware protection is explicitly disabled:");
+    emit_dword_when(c, "TAMPER.DEFENDER_DISABLED", SEV_CRIT, 92,
+        HKEY_LOCAL_MACHINE, WD, "DisableAntiVirus", 1,
+        "Microsoft Defender disabled by policy",
+        "Defender antivirus protection is explicitly disabled:");
+    emit_dword_when(c, "TAMPER.DEFENDER_DISABLED", SEV_HIGH, 86,
+        HKEY_LOCAL_MACHINE, RTP, "DisableRealtimeMonitoring", 1,
+        "Defender real-time monitoring disabled",
+        "Real-time monitoring is explicitly disabled:");
+    emit_dword_when(c, "TAMPER.DEFENDER_DISABLED", SEV_HIGH, 84,
+        HKEY_LOCAL_MACHINE, RTP, "DisableBehaviorMonitoring", 1,
+        "Defender behavior monitoring disabled",
+        "Behavior monitoring is explicitly disabled:");
+    emit_dword_when(c, "TAMPER.DEFENDER_DISABLED", SEV_HIGH, 84,
+        HKEY_LOCAL_MACHINE, RTP, "DisableOnAccessProtection", 1,
+        "Defender on-access protection disabled",
+        "On-access protection is explicitly disabled:");
+    emit_dword_when(c, "TAMPER.DEFENDER_DISABLED", SEV_HIGH, 84,
+        HKEY_LOCAL_MACHINE, RTP, "DisableIOAVProtection", 1,
+        "Defender downloaded-file scanning disabled",
+        "IOAV/downloaded-file scanning is explicitly disabled:");
+    emit_dword_when(c, "TAMPER.DEFENDER_DISABLED", SEV_HIGH, 82,
+        HKEY_LOCAL_MACHINE, RTP, "DisableScriptScanning", 1,
+        "Defender script scanning disabled",
+        "Script scanning is explicitly disabled:");
+    emit_dword_when(c, "TAMPER.DEFENDER_DISABLED", SEV_HIGH, 82,
+        HKEY_LOCAL_MACHINE, SPYNET, "DisableBlockAtFirstSeen", 1,
+        "Defender cloud block-at-first-sight disabled",
+        "Block-at-first-sight protection is explicitly disabled:");
+
+    /* TamperProtection is noisy across Windows builds, so only report a
+     * confidently bad explicit zero. Normal enabled values are non-zero. */
+    emit_dword_when(c, "TAMPER.DEFENDER_DISABLED", SEV_HIGH, 80,
+        HKEY_LOCAL_MACHINE, FEATURES, "TamperProtection", 0,
+        "Defender Tamper Protection disabled",
+        "Tamper Protection is explicitly disabled:");
+}
+
+static bool exclusion_value_suspicious(const char *name)
+{
+    if (!name || !name[0])
+        return false;
+    if (strcmp(name, "*") == 0 || strcmp(name, ".") == 0)
+        return true;
+    if (str_icontains(name, "\\users\\") ||
+        str_icontains(name, "\\appdata\\") ||
+        str_icontains(name, "\\programdata\\") ||
+        str_icontains(name, "\\temp\\") ||
+        str_icontains(name, "\\downloads\\") ||
+        str_icontains(name, "\\desktop\\") ||
+        str_icontains(name, "powershell.exe") ||
+        str_icontains(name, "pwsh.exe") ||
+        str_icontains(name, "cmd.exe") ||
+        str_icontains(name, "wscript.exe") ||
+        str_icontains(name, "cscript.exe") ||
+        str_icontains(name, "mshta.exe") ||
+        str_icontains(name, "rundll32.exe") ||
+        str_icontains(name, "regsvr32.exe"))
+        return true;
+    return false;
+}
+
+static void scan_defender_exclusion_key(ScanCtx *c, const char *leaf,
+                                        Severity base_sev)
+{
+    char subkey[SC_MAX_PATH];
+    snprintf(subkey, sizeof subkey,
+             "Software\\Microsoft\\Windows Defender\\Exclusions\\%s", leaf);
+
+    HKEY hk;
+    LONG rc = RegOpenKeyExA(HKEY_LOCAL_MACHINE, subkey, 0,
+                            KEY_READ | KEY_QUERY_VALUE, &hk);
+    if (rc != ERROR_SUCCESS) {
+        if (rc == ERROR_ACCESS_DENIED)
+            ctx_note_limit(c, "persist: access denied reading Defender exclusions");
+        return;
+    }
+
+    DWORD idx = 0;
+    for (;;) {
+        char  name[SC_MAX_PATH];
+        DWORD nlen = sizeof name;
+        BYTE  data[SC_MAX_CMDLINE];
+        DWORD dlen = sizeof data;
+        DWORD type = 0;
+        LONG e = RegEnumValueA(hk, idx, name, &nlen, NULL, &type, data, &dlen);
+        if (e == ERROR_NO_MORE_ITEMS) break;
+        idx++;
+        if (e != ERROR_SUCCESS) continue;
+        name[sizeof name - 1] = '\0';
+
+        bool broad = exclusion_value_suspicious(name);
+        if (!broad && (type == REG_SZ || type == REG_EXPAND_SZ) && dlen > 0) {
+            data[(dlen < sizeof data) ? dlen : sizeof data - 1] = '\0';
+            broad = exclusion_value_suspicious((const char *)data);
+        }
+        if (!broad && allowlist_match(name))
+            continue;
+
+        char target[SC_MAX_PATH];
+        snprintf(target, sizeof target, "%s:%s", leaf, name);
+        bus_emit(c->bus, "TAMPER.DEFENDER_EXCLUSION",
+                 broad ? SEV_HIGH : base_sev, broad ? 82 : 55,
+                 ACT_REVIEW, 0, target,
+                 broad ? "Suspicious Microsoft Defender exclusion"
+                       : "Microsoft Defender exclusion present",
+                 "HKLM\\%s value \"%s\"%s", subkey, name,
+                 broad ? " covers a broad/user-writable/tooling location" : "");
+    }
+    RegCloseKey(hk);
+}
+
+static void scan_defender_exclusions(ScanCtx *c)
+{
+    scan_defender_exclusion_key(c, "Paths", SEV_MED);
+    scan_defender_exclusion_key(c, "Processes", SEV_MED);
+    scan_defender_exclusion_key(c, "Extensions", SEV_LOW);
+}
+
+static void scan_firewall_tamper(ScanCtx *c)
+{
+    static const char *BASE =
+        "SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy";
+    static const char *profiles[] = {
+        "DomainProfile", "StandardProfile", "PublicProfile", NULL
+    };
+    for (int i = 0; profiles[i]; i++) {
+        char sub[SC_MAX_PATH];
+        snprintf(sub, sizeof sub, "%s\\%s", BASE, profiles[i]);
+        emit_dword_when(c, "TAMPER.FIREWALL_DISABLED", SEV_HIGH, 78,
+            HKEY_LOCAL_MACHINE, sub, "EnableFirewall", 0,
+            "Windows Firewall profile disabled",
+            "Firewall profile is explicitly disabled:");
+    }
+}
+
+static void scan_security_service_tamper(ScanCtx *c)
+{
+    static const struct {
+        const char *svc;
+        const char *title;
+        Severity sev;
+    } svcs[] = {
+        { "WinDefend", "Microsoft Defender Antivirus service disabled", SEV_CRIT },
+        { "WdNisSvc",  "Defender Network Inspection service disabled", SEV_HIGH },
+        { "Sense",     "Microsoft Defender for Endpoint sensor disabled", SEV_HIGH },
+        { "SecurityHealthService", "Windows Security Health service disabled", SEV_MED },
+        { NULL, NULL, SEV_INFO }
+    };
+
+    for (int i = 0; svcs[i].svc; i++) {
+        char sub[SC_MAX_PATH];
+        snprintf(sub, sizeof sub, "SYSTEM\\CurrentControlSet\\Services\\%s",
+                 svcs[i].svc);
+        DWORD start = 0;
+        if (!read_reg_dword(HKEY_LOCAL_MACHINE, sub, "Start", &start))
+            continue;
+        if (start != 4)
+            continue;
+        char target[SC_MAX_PATH];
+        snprintf(target, sizeof target, "HKLM\\%s", sub);
+        bus_emit(c->bus, "TAMPER.SECURITY_SERVICE", svcs[i].sev, 84,
+                 ACT_REVIEW, 0, target, svcs[i].title,
+                 "HKLM\\%s Start=disabled (4); malware/BYOVD commonly "
+                 "disables security services before staging payloads",
+                 sub);
+    }
+}
+
+static void scan_security_tamper(ScanCtx *c)
+{
+    scan_defender_policy_tamper(c);
+    scan_defender_exclusions(c);
+    scan_firewall_tamper(c);
+    scan_security_service_tamper(c);
+}
+
+static bool proxy_value_suspicious(const char *v)
+{
+    if (!v || !v[0])
+        return false;
+    if (str_icontains(v, "127.0.0.1") ||
+        str_icontains(v, "localhost") ||
+        str_icontains(v, "pac") ||
+        str_icontains(v, "http://") ||
+        str_icontains(v, "https://") ||
+        str_icontains(v, ".onion") ||
+        str_icontains(v, "\\appdata\\") ||
+        str_icontains(v, "\\temp\\"))
+        return true;
+    return false;
+}
+
+static void scan_proxy_policy_one(ScanCtx *c, HKEY root)
+{
+    static const char *INET =
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+    DWORD enabled = 0;
+    char proxy[SC_MAX_CMDLINE] = "";
+    char pac[SC_MAX_CMDLINE] = "";
+    bool have_proxy = read_reg_sz(root, INET, "ProxyServer", proxy, sizeof proxy);
+    bool have_pac = read_reg_sz(root, INET, "AutoConfigURL", pac, sizeof pac);
+
+    if (read_reg_dword(root, INET, "ProxyEnable", &enabled) &&
+        enabled == 1 && have_proxy && proxy[0] &&
+        !allowlist_match(proxy)) {
+        bool sus = proxy_value_suspicious(proxy);
+        bus_emit(c->bus, "PERSIST.PROXY", sus ? SEV_HIGH : SEV_MED,
+                 sus ? 78 : 55, ACT_REVIEW, 0, proxy,
+                 sus ? "Suspicious system proxy configured"
+                     : "System proxy configured",
+                 "%s\\%s ProxyEnable=1 ProxyServer=\"%s\"",
+                 root_label(root), INET, proxy);
+    }
+    if (have_pac && pac[0] && !allowlist_match(pac)) {
+        bool sus = proxy_value_suspicious(pac);
+        bus_emit(c->bus, "PERSIST.PROXY", sus ? SEV_HIGH : SEV_MED,
+                 sus ? 80 : 60, ACT_REVIEW, 0, pac,
+                 sus ? "Suspicious PAC/AutoConfig proxy configured"
+                     : "PAC/AutoConfig proxy configured",
+                 "%s\\%s AutoConfigURL=\"%s\"",
+                 root_label(root), INET, pac);
+    }
+}
+
+static void scan_proxy_policy(ScanCtx *c)
+{
+    scan_proxy_policy_one(c, HKEY_CURRENT_USER);
+    scan_proxy_policy_one(c, HKEY_LOCAL_MACHINE);
+}
+
+static void scan_browser_forced_extensions_one(ScanCtx *c, HKEY root,
+                                               const char *vendor,
+                                               const char *browser)
+{
+    char subkey[SC_MAX_PATH];
+    snprintf(subkey, sizeof subkey,
+             "Software\\Policies\\%s\\%s\\ExtensionInstallForcelist",
+             vendor, browser);
+
+    HKEY hk;
+    LONG rc = RegOpenKeyExA(root, subkey, 0,
+                            KEY_READ | KEY_QUERY_VALUE, &hk);
+    if (rc != ERROR_SUCCESS)
+        return;
+
+    DWORD idx = 0;
+    for (;;) {
+        char  name[SC_NAME_LEN];
+        DWORD nlen = sizeof name;
+        BYTE  data[SC_MAX_CMDLINE];
+        DWORD dlen = sizeof data;
+        DWORD type = 0;
+        LONG e = RegEnumValueA(hk, idx, name, &nlen, NULL, &type, data, &dlen);
+        if (e == ERROR_NO_MORE_ITEMS) break;
+        idx++;
+        if (e != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ))
+            continue;
+        if (dlen == 0) continue;
+        data[(dlen < sizeof data) ? dlen : sizeof data - 1] = '\0';
+        data[sizeof data - 1] = '\0';
+        char raw[SC_MAX_CMDLINE];
+        if (type == REG_EXPAND_SZ) expand_env((const char *)data, raw, sizeof raw);
+        else { strncpy(raw, (const char *)data, sizeof raw - 1);
+               raw[sizeof raw - 1] = '\0'; }
+        trim_ws(raw);
+        if (!raw[0] || allowlist_match(raw))
+            continue;
+
+        bool external = str_icontains(raw, "http://") ||
+                        str_icontains(raw, "https://") ||
+                        str_icontains(raw, ";");
+        bus_emit(c->bus, "PERSIST.BROWSER_EXTENSION",
+                 external ? SEV_HIGH : SEV_MED, external ? 78 : 65,
+                 ACT_REVIEW, 0, raw,
+                 "Browser extension force-installed by policy",
+                 "%s\\%s value \"%s\" = \"%s\"",
+                 root_label(root), subkey, name, raw);
+    }
+    RegCloseKey(hk);
+}
+
+static void scan_browser_forced_extensions(ScanCtx *c)
+{
+    scan_browser_forced_extensions_one(c, HKEY_LOCAL_MACHINE, "Google", "Chrome");
+    scan_browser_forced_extensions_one(c, HKEY_CURRENT_USER,  "Google", "Chrome");
+    scan_browser_forced_extensions_one(c, HKEY_LOCAL_MACHINE, "Microsoft", "Edge");
+    scan_browser_forced_extensions_one(c, HKEY_CURRENT_USER,  "Microsoft", "Edge");
+}
+
+static bool app_path_name_sensitive(const char *sub)
+{
+    static const char *names[] = {
+        "cmd.exe", "powershell.exe", "pwsh.exe", "wscript.exe",
+        "cscript.exe", "mshta.exe", "rundll32.exe", "regsvr32.exe",
+        "regedit.exe", "taskmgr.exe", "mmc.exe", "control.exe",
+        "msiexec.exe", "schtasks.exe", "sc.exe", "net.exe", NULL
+    };
+    char leaf[SC_NAME_LEN];
+    base_name(sub, leaf, sizeof leaf);
+    if (!leaf[0]) {
+        strncpy(leaf, sub ? sub : "", sizeof leaf - 1);
+        leaf[sizeof leaf - 1] = '\0';
+    }
+    str_lower(leaf);
+    for (int i = 0; names[i]; i++)
+        if (strcmp(leaf, names[i]) == 0)
+            return true;
+    return false;
+}
+
+static void scan_app_paths_hijack_one(ScanCtx *c, HKEY root)
+{
+    static const char *APP_PATHS =
+        "Software\\Microsoft\\Windows\\CurrentVersion\\App Paths";
+    HKEY hk;
+    LONG rc = RegOpenKeyExA(root, APP_PATHS, 0,
+                            KEY_READ | KEY_ENUMERATE_SUB_KEYS, &hk);
+    if (rc != ERROR_SUCCESS)
+        return;
+
+    DWORD idx = 0;
+    for (; idx < 4096; ) {
+        char  sub[SC_NAME_LEN];
+        DWORD slen = sizeof sub;
+        LONG e = RegEnumKeyExA(hk, idx, sub, &slen, NULL, NULL, NULL, NULL);
+        if (e == ERROR_NO_MORE_ITEMS) break;
+        idx++;
+        if (e != ERROR_SUCCESS) continue;
+
+        char full[SC_MAX_PATH];
+        snprintf(full, sizeof full, "%s\\%s", APP_PATHS, sub);
+        char val[SC_MAX_CMDLINE];
+        if (!read_reg_sz(root, full, NULL, val, sizeof val))
+            continue;
+        trim_ws(val);
+        if (!val[0]) continue;
+
+        char target[SC_MAX_PATH];
+        extract_target(val, target, sizeof target);
+        if (!target[0]) {
+            strncpy(target, val, sizeof target - 1);
+            target[sizeof target - 1] = '\0';
+        }
+        if (allowlist_match(target) || allowlist_match(sub))
+            continue;
+
+        if (str_icontains(target, "\\windowsapps\\"))
+            continue; /* normal Store/App Execution Alias population */
+
+        SignVerdict v = SIGN_UNKNOWN;
+        if (GetFileAttributesA(target) != INVALID_FILE_ATTRIBUTES)
+            v = sign_verify(target, NULL, 0);
+
+        PathLoc loc = path_classify(target);
+        bool user_writable = path_is_user_writable(target);
+        bool unsigned_bad = (v == SIGN_UNSIGNED || v == SIGN_INVALID);
+        bool tempish = (loc == PATHLOC_TEMP || loc == PATHLOC_RECYCLE);
+        bool sensitive = app_path_name_sensitive(sub);
+
+        if (sensitive && v == SIGN_SIGNED_MS &&
+            (loc == PATHLOC_SYSTEM || loc == PATHLOC_WINDOWS))
+            continue;
+
+        if (!sensitive && !(unsigned_bad && user_writable) && !tempish)
+            continue;
+
+        const char *why = sensitive ? "sensitive command name" :
+                          tempish ? "temp/recycle target" :
+                          (v == SIGN_INVALID ? "invalid signature in user-writable path" :
+                                               "unsigned in user-writable path");
+
+        bus_emit(c->bus, "PERSIST.APP_PATHS",
+                 (sensitive || tempish) ? SEV_HIGH : SEV_MED,
+                 (sensitive || tempish) ? 78 : 65,
+                 ACT_REVIEW, 0, target,
+                 root == HKEY_CURRENT_USER ?
+                    "Per-user App Paths execution hijack" :
+                    "Suspicious App Paths target",
+                 "%s\\%s default=\"%s\" -> %s [%s; %s%s%s]",
+                 root_label(root), full, val, target, why, sign_name(v),
+                 user_writable ? "; user-writable" : "",
+                 tempish ? "; temp-like" : "");
+    }
+    RegCloseKey(hk);
+}
+
+static void scan_app_paths_hijack(ScanCtx *c)
+{
+    if (reg_key_exists(HKEY_CURRENT_USER,
+            "Software\\Microsoft\\Windows\\CurrentVersion\\App Paths"))
+        scan_app_paths_hijack_one(c, HKEY_CURRENT_USER);
+    scan_app_paths_hijack_one(c, HKEY_LOCAL_MACHINE);
+}
+
+/* ------------------------------------------------------------------ *
  *  entry point
  * ------------------------------------------------------------------ */
 
@@ -1722,6 +2442,10 @@ void scan_persist(ScanCtx *c)
     scan_ifeo(c);
     scan_com_hijack(c);
     scan_svc_registry(c);
+    scan_security_tamper(c);
+    scan_proxy_policy(c);
+    scan_browser_forced_extensions(c);
+    scan_app_paths_hijack(c);
 
     /* Filesystem-based checks. */
     scan_startup_folders(c, com_ok);

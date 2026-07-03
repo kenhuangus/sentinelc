@@ -44,6 +44,15 @@ static size_t           g_pe_cache_count = 0;
 static CRITICAL_SECTION g_pe_cache_lock;
 static INIT_ONCE        g_pe_cache_once = INIT_ONCE_STATIC_INIT;
 static bool             g_pe_cache_ready = false;
+static volatile LONG64  g_pe_calls = 0;
+static volatile LONG64  g_pe_hits = 0;
+static volatile LONG64  g_pe_misses = 0;
+static volatile LONG64  g_pe_stores = 0;
+
+static uint64_t atomic_read64(volatile LONG64 *p)
+{
+    return (uint64_t)InterlockedCompareExchange64(p, 0, 0);
+}
 
 static BOOL CALLBACK pe_cache_init_once(PINIT_ONCE once, PVOID param, PVOID *ctx)
 {
@@ -129,8 +138,26 @@ static void pe_cache_put(const char *lpath, uint64_t mtime, uint64_t fsize,
         e->result = result;
         e->used   = true;
         g_pe_cache_count++;
+        InterlockedIncrement64(&g_pe_stores);
     }
     LeaveCriticalSection(&g_pe_cache_lock);
+}
+
+void pe_cache_stats(PeCacheStats *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    out->calls  = atomic_read64(&g_pe_calls);
+    out->hits   = atomic_read64(&g_pe_hits);
+    out->misses = atomic_read64(&g_pe_misses);
+    out->stores = atomic_read64(&g_pe_stores);
+    out->enabled = g_pe_cache_ready;
+
+    if (g_pe_cache_ready) {
+        EnterCriticalSection(&g_pe_cache_lock);
+        out->entries = (uint64_t)g_pe_cache_count;
+        LeaveCriticalSection(&g_pe_cache_lock);
+    }
 }
 
 /* ---- local bounds helpers -------------------------------------------------
@@ -227,6 +254,40 @@ static void classify_import(const char *fn, PeInfo *out)
     /* Raw input */
     if (ieq(fn, "RegisterRawInputDevices") || ieq(fn, "GetRawInputData"))
         out->imp_rawinput_api = true;
+
+    /* Clipboard/input theft. Clipboard polling/listening plus egress is a
+     * common infostealer shape and is part of MITRE ATT&CK Input Capture. */
+    if (ieq(fn, "OpenClipboard") || ieq(fn, "GetClipboardData") ||
+        ieq(fn, "EnumClipboardFormats") ||
+        ieq(fn, "GetPriorityClipboardFormat") ||
+        ieq(fn, "IsClipboardFormatAvailable") ||
+        ieq(fn, "AddClipboardFormatListener") ||
+        ieq(fn, "RemoveClipboardFormatListener") ||
+        ieq(fn, "SetClipboardViewer") || ieq(fn, "ChangeClipboardChain") ||
+        istartswith(fn, "RegisterClipboardFormat"))
+        out->imp_clipboard_api = true;
+
+    /* Screen capture. Avoid ultra-broad GetDC-only signals; these APIs are
+     * stronger indicators of screenshot/desktop capture capability. */
+    if (ieq(fn, "BitBlt") || ieq(fn, "StretchBlt") ||
+        ieq(fn, "PrintWindow") || ieq(fn, "CreateCompatibleBitmap") ||
+        ieq(fn, "CreateDIBSection") || ieq(fn, "GetWindowDC") ||
+        ieq(fn, "GetDesktopWindow"))
+        out->imp_screen_api = true;
+
+    /* Microphone/camera capture capability. */
+    if (istartswith(fn, "waveIn") || istartswith(fn, "capCreateCaptureWindow") ||
+        ieq(fn, "MFEnumDeviceSources") || ieq(fn, "MFCreateDeviceSource") ||
+        ieq(fn, "MFCreateSourceReaderFromMediaSource"))
+        out->imp_media_capture_api = true;
+
+    /* Secret-read APIs used by credential grabbers. CryptUnprotectData is
+     * broad by itself, so downstream rules require other risk signals too. */
+    if (istartswith(fn, "CredRead") || istartswith(fn, "CredEnumerate") ||
+        ieq(fn, "CryptUnprotectData") || ieq(fn, "VaultEnumerateVaults") ||
+        ieq(fn, "VaultOpenVault") || ieq(fn, "VaultGetItem") ||
+        ieq(fn, "PStoreCreateInstance"))
+        out->imp_cred_api = true;
 
     /* Networking (function-name signal; DLL-name signal handled separately) */
     if (ieq(fn, "connect") || ieq(fn, "send") || ieq(fn, "WSASocketW") ||
@@ -382,6 +443,7 @@ bool pe_analyze(const char *path, PeInfo *out)
     if (!out) return false;
     memset(out, 0, sizeof *out);
     if (!path || path[0] == '\0') return false;
+    InterlockedIncrement64(&g_pe_calls);
 
     bool result = false;
     HANDLE hFile = INVALID_HANDLE_VALUE;
@@ -399,9 +461,11 @@ bool pe_analyze(const char *path, PeInfo *out)
         bool   cached_result;
         if (pe_cache_get(ckey, cmtime, csize, &cached, &cached_result)) {
             *out = cached;            /* copy by value, no dangling pointer */
+            InterlockedIncrement64(&g_pe_hits);
             return cached_result;
         }
     }
+    InterlockedIncrement64(&g_pe_misses);
 
     wchar_t wpath[SC_MAX_PATH * 2];
     if (utf8_to_wide(path, wpath, sizeof wpath / sizeof wpath[0]) == 0)

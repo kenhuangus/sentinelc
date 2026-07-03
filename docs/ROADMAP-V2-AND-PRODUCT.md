@@ -1,147 +1,88 @@
-# SentinelC v2 + Productization Plan
+# SentinelC Roadmap And Productization Plan
 
-Two questions: what does v2 look like technically, and what would it take to sell
-this as a product. This doc answers both honestly, including the parts that are
-hard or that this machine cannot do.
+This document reflects the current codebase after the July 2026 hardening pass.
+Several items that older drafts called "v2" are now implemented in the user-mode
+scanner and should not be presented as future work.
 
-## Part 1 — What v2 actually is
+## Current Product Shape
 
-v2 has one headline feature (a kernel driver) that is design-only on this
-machine, and a set of user-mode features that are buildable now with the
-existing MinGW toolchain. Build the buildable set first; it delivers most of the
-value without the cost and risk of shipping a driver.
+SentinelC is an on-demand, transparent Windows triage and response tool:
 
-### 1a. Buildable now (user-mode, current toolchain) — do these first
+- Native C scanner with no cloud dependency.
+- User-mode malware, persistence, network, keylogger/spyware, rootkit-style
+  cross-view, credential-access, memory-injection, and AMSI/ETW tamper checks.
+- Offline-like VSS hunting without rebooting.
+- Merkle FIM baseline/check with authenticated baselines and full content
+  rehashing.
+- Fleet Console with protected read APIs, per-host ingest tokens, and HTTPS-only
+  remote upload helpers.
+- Endpoint installer that runs scheduled scans as SYSTEM after one install-time
+  elevation.
+- Canonical segment-aware path classification and action-aware scheduled-task
+  parsing for Exec and ComHandler actions.
+- In-process PE analysis caching and SHA-256-validated persistent signature
+  caching when the local cache directory can be secured.
+- Codex skill/plugin packaging for guided incident-response workflows.
 
-1. **In-memory injected-code & process-hollowing scanning.** The single highest
-   value. Today the RWX-memory rule flags that suspicious memory *exists* but
-   never reads it. v2 reads flagged private/RWX regions and scans for shellcode
-   markers and reflective-PE `MZ`/`PE` headers, and compares each module's
-   in-memory headers against its on-disk file to catch hollowing. This is the
-   structural answer to "every IAT heuristic is defeated by packing": a packed
-   loader hides its imports but cannot hide the code it unpacks into memory.
-   Effort: L. New rules `MEM.SHELLCODE`, `MEM.REFLECTIVE_PE`, `PROC.HOLLOWED`.
-2. **AMSI / ETW tamper detection.** Read `amsi.dll!AmsiScanBuffer` and
-   `ntdll!EtwEventWrite` prologues in each process and compare to the clean
-   on-disk bytes. A patched prologue is the classic "blind the defender" move
-   and is memory-resident, so it survives packing. Effort: M. Rules
-   `EVADE.AMSI_PATCH`, `EVADE.ETW_PATCH`.
-3. **A real YARA engine.** Replace the substring IOC matcher with compiled rule
-   conditions, hex patterns with wildcards, and string sets. Either embed
-   libyara or implement a focused subset. This is the feature security buyers
-   expect by name. Effort: L.
-4. **Authenticated baseline (FIM integrity).** HMAC the Merkle baseline with a
-   key stored outside the baseline's directory, and warn when the baseline file
-   is writable by non-admins, so an attacker cannot silently shrink the
-   monitored set. Effort: M.
-5. **Output and integration polish.** NDJSON streaming, a stable JSON schema
-   with a version field, Sigma/STIX export, and an exit-code contract for CI.
-   This is what makes it embeddable in someone else's pipeline. Effort: M.
+## What Still Belongs In v2
 
-### 1b. Design-only here (the kernel driver) — needs WDK + signing
+1. **Performance engineering.**
+   Parallelize FIM hashing and profile full scans without weakening integrity
+   semantics.
 
-The driver is the only honest way to (a) see a kernel rootkit and (b) block in
-real time. It cannot be built or loaded on this machine (no WDK/MSVC; driver
-load requires an EV cert + Microsoft attestation signing). v2 ships a design and
-a WDK-buildable skeleton, not a working driver, until that toolchain exists.
+2. **YARA maturity.**
+   Either embed libyara or publish a documented supported subset for
+   `yara_lite.c` with tests.
 
-Design shape:
-- A **minifilter** (FltMgr) for real-time file and process callbacks
-  (`PsSetCreateProcessNotifyRoutineEx`, `ObRegisterCallbacks` to strip dangerous
-  handle rights to LSASS, image-load callbacks for unsigned drivers).
-- A **kernel cross-view**: walk the kernel's own process/handle/driver lists and
-  hand them to the user-mode engine over an IOCTL, so the existing cross-view
-  diff gains a vantage point a DKOM rootkit cannot lie to from user mode.
-- A thin user-mode/kernel protocol (a single device + versioned IOCTLs) so the
-  current scanner becomes the driver's client.
-- Honest scope even with a driver: a driver competing with vendor anti-tamper
-  and with attackers who also load drivers (BYOVD) is a real arms race; this is
-  detection-and-visibility, still not a full EDR.
+3. **Signed kernel driver.**
+   A driver is still the only honest route to kernel-vantage rootkit visibility
+   and real-time blocking. It requires WDK/MSVC, EV/attestation signing, a driver
+   update model, and a much larger testing burden.
 
-Cost to actually ship the driver: a Windows Hardware Dev account, an EV code-
-signing certificate, WHQL/attestation submission, and a test-signing dev loop.
-That is real money and real calendar time, and it is the gate, not the code.
+## Productization Must-Haves
 
-## Part 2 — Selling it as a product
+1. **Code-sign the binary and installer.**
+   Unsigned admin tools will be distrusted and may be blocked by SmartScreen or
+   AV reputation systems.
 
-The honest market read first, then the concrete to-do list.
+2. **Release channel and update story.**
+   Security tools need versioned releases, update checks, and a rollback plan.
 
-### 2a. Positioning — what it is and is not
+3. **Operator report.**
+   Add a clean HTML/PDF report with findings, evidence, severity, limitations,
+   and response actions. This is what an IR technician attaches to a ticket.
 
-It will not win as "a cheaper Defender/CrowdStrike." Those win on cloud
-telemetry, ML, and kernel agents, and that race needs capital this does not
-have. It can win as a **fast, transparent, on-demand triage and IR tool** for
-people who already suspect something and want answers they can read. The buyers
-who feel that pain: incident responders, MSP/MSSP technicians, SOC analysts, and
-power users doing a "is this box clean" check. Lead with transparency and speed,
-not coverage.
+4. **Fleet deployment guidance.**
+   The current Fleet Console is functional. Production deployments need TLS in
+   front of it, token rotation, backup guidance for `data/`, and clear endpoint
+   enrollment/de-enrollment steps.
 
-### 2b. The must-haves before anyone pays
+5. **Support and liability boundaries.**
+   Preserve the honest scope: SentinelC is a transparent triage and response
+   tool, not a full EDR replacement. Keep dry-run defaults, confirmation gates,
+   audit logs, and limitation messaging prominent.
 
-These are table stakes; without them the tool reads as a hobby project no matter
-how good the engine is.
+## Positioning
 
-1. **Code-sign the binary.** Today `sentinelc.exe` is unsigned, so SmartScreen
-   and other AV flag it on download. An OV or EV code-signing certificate (a few
-   hundred dollars a year) is non-negotiable for a security product people run
-   as admin. This is the first dollar to spend.
-2. **An installer + auto-update.** An MSI/EXE installer, a versioned release
-   channel, and an update check. Security tools that cannot update themselves
-   are a liability.
-3. **A real report, not just console text.** A clean HTML/PDF report with the
-   findings, evidence, severity, and a remediation summary. This is what a
-   technician hands a client or attaches to a ticket.
-4. **A management view for fleets.** The single biggest revenue unlock: run it
-   across many machines and roll the JSON up into one dashboard. MSPs buy
-   per-endpoint visibility, not a single CLI. Even a thin server that ingests the
-   NDJSON and shows a fleet table changes the price point entirely.
-5. **Documentation and support.** A docs site, a getting-started that takes
-   minutes, and a support channel. Security buyers buy trust and answers.
+Do not sell SentinelC as a cheaper Defender or CrowdStrike. Those products win
+on cloud reputation, managed telemetry, kernel agents, and scale. SentinelC's
+strongest lane is:
 
-### 2c. Differentiators worth marketing
+- Fast on-demand host triage.
+- Explainable evidence for each finding.
+- Local-only operation when needed.
+- Open, inspectable rules and source.
+- Useful IR workflows that can be packaged as a CLI, endpoint scheduled task,
+  and fleet dashboard.
 
-- **Transparency:** every rule is readable, every finding cites evidence. No
-  black box. This is genuinely rare and worth leading with.
-- **Speed:** a full triage in seconds, no agent, no cloud round-trip.
-- **The FIM Merkle baseline:** "tell me exactly what executable changed since
-  yesterday" is a clean, demoable story.
-- **The incident proof:** it found a real infostealer's dropper engine that
-  three cleanups and a commercial AV missed. That case study sells.
+Recommended business model remains open-core: keep the scanner transparent and
+sell fleet management, polished reporting, release support, and incident-response
+workflow help.
 
-### 2d. Business model options
+## Suggested Next Sequence
 
-- **Open-core.** Keep the engine open (trust + adoption), sell the fleet
-  console, reporting, and support. Fits the "transparency" brand best.
-- **Commercial license for the CLI** to MSPs/IR shops, per-technician or
-  per-endpoint. Simple, but commodity CLIs are hard to defend.
-- **IR-engagement tooling.** Sell it bundled with an IR service, where the tool
-  is the delivery vehicle and the service is the product.
-Recommended: open-core, with the fleet console + reporting + support as the paid
-tier. It matches the only real moat here (transparency and speed).
-
-### 2e. The hard truths
-
-- **Liability.** A security product that misses a threat, or kills a legitimate
-  process, carries real risk. You need a clear license disclaimer, conservative
-  defaults (dry-run already is), and an allowlist story.
-- **The trust paradox.** You are asking people to run an admin tool that kills
-  processes and quarantines files. Code signing, open source, and a clean track
-  record are the only currencies that buy that trust.
-- **Support cost.** Every endpoint product generates support load
-  disproportionate to its price. Budget for it or scope the buyer narrowly
-  (technical users who self-serve).
-- **The market is crowded** at the top (EDR) and at the bottom (free AV). The
-  open lane is the transparent, fast, IR-grade triage tool for technical
-  responders. Stay in that lane.
-
-## Suggested sequence
-
-1. Build the v2 user-mode features in 1a, in order (memory scanning first — it
-   is the biggest detection gain and the best demo).
-2. Code-sign the binary and stand up an installer + release channel. This is the
-   cheapest, highest-leverage productization step.
-3. Build the thin fleet console (ingest NDJSON, fleet table). This is the
-   revenue unlock.
-4. Treat the kernel driver as a funded milestone, not a sprint — it needs the
-   WDK toolchain, an EV cert, and Microsoft attestation before a single line of
-   it can ship.
+1. Profile the full scan and parallelize FIM hashing.
+2. Package signed releases and installer builds.
+3. Harden Fleet Console deployment: TLS reverse-proxy recipes, host token
+   rotation, and enrollment docs.
+4. Treat kernel-driver work as a funded milestone, not a sprint.

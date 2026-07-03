@@ -4,7 +4,8 @@ A fast, native-C, on-demand threat-triage scanner for Windows 10/11 (x64).
 It enumerates everything that runs, persists, listens, or hooks input, flags
 anomalies with **explainable** heuristics, detects user-mode rootkit hiding via
 cross-view diffing, and can terminate/disable confirmed threats — all in one
-small `.exe` with no installer, no cloud, no kernel driver.
+small `.exe` that can run without installation, with no cloud dependency and no
+kernel driver.
 
 > **Honest scope.** This is a *triage and response* tool, not a replacement for
 > Defender/EDR. It wins on **speed and transparency** (a full scan in seconds,
@@ -16,12 +17,15 @@ small `.exe` with no installer, no cloud, no kernel driver.
 
 | Family | Rules (examples) |
 |---|---|
-| Malicious processes | `PROC.MASQUERADE`, `PROC.TEMP_PATH`, `PROC.RWX_MEM`, `PROC.PACKED`, `PROC.SUSPICIOUS_PARENT` |
-| Suspicious services | `SVC.UNSIGNED`, `SVC.USERWRITABLE_PATH`, `SVC.UNQUOTED_PATH`, `SVC.SUSPICIOUS_DLL` |
-| Persistence | `PERSIST.RUNKEY`, `PERSIST.WINLOGON`, `PERSIST.IFEO`, `PERSIST.APPINIT`, `PERSIST.TASK`, `PERSIST.WMI_SUB`, `PERSIST.STARTUP_FOLDER`, `PERSIST.COM_HIJACK` |
+| Malicious processes | `PROC.MASQUERADE`, `PROC.TEMP_PATH`, `PROC.RWX_MEM`, `PROC.PACKED`, `PROC.SUSPICIOUS_PARENT`, `PROC.LOLBIN_ARGS`, `PROC.ENCODED_CMD`, `PROC.PPID_SPOOF` |
+| Suspicious services | `SVC.UNSIGNED`, `SVC.UNVERIFIED`, `SVC.USERWRITABLE_PATH`, `SVC.UNQUOTED_PATH`, `SVC.SUSPICIOUS_DLL` |
+| Persistence | `PERSIST.RUNKEY`, `PERSIST.WINLOGON`, `PERSIST.IFEO`, `PERSIST.APPINIT`, `PERSIST.APPCERT`, `PERSIST.LSA_PROVIDER`, `PERSIST.TASK`, `PERSIST.TASK_COMHANDLER`, `PERSIST.WMI_SUB`, `PERSIST.SVC_REGISTRY`, `PERSIST.COM_HIJACK` |
 | C2 / RCE / reverse shells | `NET.SHELL_SOCKET`, `NET.LISTEN_SUSPICIOUS_PROC`, `NET.RAW_IP_OUTBOUND`, `NET.BEACON`, `NET.IOC_MATCH` |
-| Keyloggers / hooks | `KEY.LL_HOOK`, `KEY.RAW_INPUT`, `KEY.POLL_HEURISTIC`, `KEY.INJECTED_DLL` |
+| Keyloggers / spyware | `KEY.LL_HOOK`, `KEY.RAW_INPUT`, `KEY.POLL_HEURISTIC`, `SPY.MULTI_CAPTURE`, `SPY.CLIPBOARD`, `SPY.SCREEN_CAPTURE` |
 | Rootkits (cross-view) | `RK.HIDDEN_PROC`, `RK.HIDDEN_FILE`, `RK.SUSPICIOUS_DRIVER` |
+| Credential, memory, evasion | `CRED.LSASS_HANDLE`, `CRED.SENSITIVE_FILE`, `MEM.SHELLCODE`, `MEM.REFLECTIVE_PE`, `PROC.HOLLOWED`, `EVADE.AMSI_PATCH`, `EVADE.ETW_PATCH` |
+| File integrity | `FIM.MODIFIED`, `FIM.ADDED`, `FIM.REMOVED`, `FIM.BASELINE_TAMPERED` |
+| Offline-like hunting | `OFFLINE.SNAPSHOT`, `OFFLINE.RAW_VOLUME`, `OFFLINE.DEFENDER_EXCLUSION`, `OFFLINE.BOOT_DRIVER`, `OFFLINE.RUNKEY` |
 | Correlation | `CORR.IMPLANT` (unsigned multi-signal), `CORR.MULTI_SIGNAL` |
 
 A post-scan **correlation pass** fuses multiple signals on one PID into a single
@@ -77,7 +81,8 @@ build\sentinelc.exe --full
 ### One-click elevated launcher
 Double-click **`sentinelc-admin.cmd`** (or run it from any prompt). It triggers
 the UAC prompt, runs `--full`, keeps the window open, and points you at the
-audit log. Pass your own args: `sentinelc-admin.cmd --quick --json`.
+audit log. For custom scan arguments, use the PowerShell launcher instead:
+`powershell -ExecutionPolicy Bypass -File sentinelc-admin.ps1 --quick --json`.
 
 ## Usage
 
@@ -86,10 +91,13 @@ sentinelc.exe [scan-mode] [options]
 
 Scan modes:
   --quick            process + service + persistence + network   (default, fast)
-  --full             everything (adds keylogger + rootkit cross-view)
+  --full             all live scanners (adds keylogger, rootkit, creds, memory, evasion)
   --deep             hash files / heavier checks
   --watch N          sample network for N seconds to catch C2 beaconing
   --scan-path PATH   scan a file or directory only (entropy/signing/IOC)
+  --offline-like     VSS snapshot + offline hive/boot-driver hunt, no reboot
+  --offline-passes N repeat offline-like snapshot passes (default: 2)
+  --offline-roots "A;B;C"  extra live roots to map into the snapshot and scan
 
 Integrity (Merkle file-integrity monitoring):
   --baseline                 build/update a Merkle baseline of execution-relevant
@@ -142,6 +150,9 @@ build\sentinelc.exe --quick
 :: deep sweep + 30s beacon watch, JSON to a file
 build\sentinelc.exe --full --deep --watch 30 --json > scan.json
 
+:: Defender Offline-style hunt without rebooting (run elevated)
+build\sentinelc.exe --offline-like --offline-passes 2 --json > offline-like.json
+
 :: scan a suspicious download
 build\sentinelc.exe --scan-path "C:\Users\me\Downloads\invoice.exe" --deep
 
@@ -164,8 +175,8 @@ build\sentinelc.exe --integrity --integrity-roots "C:\path\to\project"
 `--baseline` hashes every execution-relevant file (PE binaries, scripts, source
 code, `.md`, and execution-affecting config) under the chosen roots, builds a
 **Merkle tree** (leaf = `SHA256(lowercased-abspath ‖ content-hash)`, combined
-pairwise to a single root), and stores a sorted manifest. `--integrity` re-walks
-and diffs against it:
+pairwise to a single root), and stores a sorted manifest. `--integrity` re-walks,
+rehashes file contents, and diffs against it:
 
 - The **Merkle root** is a single hash that proves the whole set is unchanged
   (`[MATCH]`) or changed (`[CHANGED]`) in one comparison.
@@ -175,10 +186,30 @@ and diffs against it:
 - A first baseline of large system roots is slow (it hashes every file); scope
   with `--integrity-roots` for fast, targeted monitoring of a project or folder.
 
+## Offline-like hunting without rebooting
+
+`--offline-like` is the closest safe no-reboot analogue to Defender Offline. It
+creates a short-lived VSS snapshot of the system volume, scans high-value paths
+through the snapshot namespace, opens raw NTFS volume metadata, and inspects
+offline registry hives copied from the snapshot. It hunts for broad Defender
+exclusions, suspicious offline Run keys, and boot/system drivers that are
+missing, unsigned/invalid, user-writable, or outside normal driver locations.
+
+Run it elevated:
+```
+build\sentinelc.exe --offline-like --offline-passes 2
+```
+
+Use `--offline-roots "C:\path\one;C:\path\two"` for broader folder sweeps. The
+default snapshot path scan is intentionally bounded to drivers, scheduled tasks,
+and startup folders so a normal run does not spend hours crawling user data.
+
 ## Notes & limitations
 - User-mode only: a kernel rootkit that lies to every user API defeats the
   cross-view checks. Drivers are inventoried and signature-checked, which catches
   the common unsigned-driver case.
+- `--offline-like` narrows the Defender Offline gap, but it cannot fully replace
+  a rebooted trusted scanner because the current Windows kernel is still active.
 - First run is slower (it verifies signatures for every process/service);
   results are cached within a run.
 - This is a dual-use security tool. Use it on systems you are authorized to

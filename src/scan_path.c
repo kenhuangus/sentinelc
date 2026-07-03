@@ -22,12 +22,15 @@
 #include <bcrypt.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(s) (((NTSTATUS)(s)) >= 0)
 #endif
 
 #define SCAN_MAX_DEPTH 32
+#define CONTENT_SCAN_CHUNK   (1u * 1024u * 1024u)
+#define CONTENT_SCAN_OVERLAP (64u * 1024u)
 
 /* Cumulative count of files analyzed in this scan (drives the progress bar).
  * Single-threaded scanner, so a plain file-local counter is sufficient. */
@@ -148,30 +151,110 @@ static uint64_t count_files(const char *dir, int depth)
     return total;
 }
 
-/* Read up to cap-1 bytes of a file into buf and NUL-terminate. Embedded NUL
- * bytes are replaced with spaces so ASCII markers inside binaries still match a
- * substring search. Returns bytes read (0 on error). */
-static size_t read_file_text(const char *path, char *buf, size_t cap, bool strip)
+static bool yara_rule_applies_to_file(const char *rule, bool is_pe)
 {
-    if (cap == 0) return 0;
+    if (!rule || !is_pe)
+        return true;
+
+    /* These generic rules describe script/document payloads. PE files often
+     * contain the same strings in benign detector logic, docs, or resources. */
+    if (_stricmp(rule, "Obfuscated_PowerShell") == 0 ||
+        _stricmp(rule, "Script_Dropper_Markers") == 0 ||
+        _stricmp(rule, "Embedded_PE_In_Nonexe") == 0)
+        return false;
+
+    return true;
+}
+
+static bool is_current_scanner_image(const char *path)
+{
+    if (!path || !path[0])
+        return false;
+    char self[SC_MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, self, sizeof(self));
+    if (n == 0 || n >= sizeof(self))
+        return false;
+    self[sizeof(self) - 1] = '\0';
+
+    char full[SC_MAX_PATH];
+    DWORD m = GetFullPathNameA(path, sizeof(full), full, NULL);
+    if (m == 0 || m >= sizeof(full))
+        return false;
+    full[sizeof(full) - 1] = '\0';
+
+    return _stricmp(self, full) == 0;
+}
+
+static void scan_content_indicators(ScanCtx *c, const char *path, bool is_pe)
+{
+    if (!c || (!c->yara && !c->ioc))
+        return;
+
     wchar_t wpath[SC_MAX_PATH * 2];
     if (utf8_to_wide(path, wpath, sizeof wpath / sizeof wpath[0]) == 0)
-        return 0;
+        return;
+
     HANDLE h = CreateFileW(wpath, GENERIC_READ,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    if (h == INVALID_HANDLE_VALUE) return 0;
-    DWORD rd = 0;
-    BOOL ok = ReadFile(h, buf, (DWORD)(cap - 1), &rd, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+
+    size_t cap = CONTENT_SCAN_CHUNK + CONTENT_SCAN_OVERLAP + 1;
+    unsigned char *raw = (unsigned char *)malloc(cap);
+    char *text = c->ioc ? (char *)malloc(cap) : NULL;
+    if (!raw || (c->ioc && !text)) {
+        free(raw);
+        free(text);
+        CloseHandle(h);
+        return;
+    }
+
+    bool yara_found = false;
+    bool string_found = false;
+    size_t carry = 0;
+    for (;;) {
+        DWORD rd = 0;
+        if (!ReadFile(h, raw + carry, CONTENT_SCAN_CHUNK, &rd, NULL))
+            break;
+        if (rd == 0)
+            break;
+
+        size_t got = carry + rd;
+        if (!yara_found && c->yara) {
+            char rulename[80];
+            if (yara_scan(c->yara, raw, got, rulename, sizeof rulename) &&
+                yara_rule_applies_to_file(rulename, is_pe)) {
+                bus_emit(c->bus, "FILE.YARA_MATCH", SEV_HIGH, 85, ACT_QUARANTINE,
+                         0, path, "File content matches a YARA rule",
+                         "matched YARA rule '%s'", rulename);
+                yara_found = true;
+            }
+        }
+
+        if (!string_found && c->ioc) {
+            memcpy(text, raw, got);
+            for (size_t i = 0; i < got; i++)
+                if (text[i] == '\0') text[i] = ' ';
+            text[got] = '\0';
+            if (ioc_match_string(c->ioc, text)) {
+                bus_emit(c->bus, "FILE.IOC_STRING", SEV_HIGH, 90, ACT_QUARANTINE,
+                         0, path, "File content matches a known-bad string IOC",
+                         "matched a loaded indicator (string/C2 domain)");
+                string_found = true;
+            }
+        }
+
+        if ((!c->yara || yara_found) && (!c->ioc || string_found))
+            break;
+
+        carry = got < CONTENT_SCAN_OVERLAP ? got : CONTENT_SCAN_OVERLAP;
+        memmove(raw, raw + got - carry, carry);
+    }
+
+    free(raw);
+    free(text);
     CloseHandle(h);
-    if (!ok) return 0;
-    /* strip=true: NUL -> space for the NUL-terminated substring IOC matcher.
-     * strip=false: keep raw bytes (YARA wide/hex patterns rely on the NULs). */
-    if (strip)
-        for (DWORD i = 0; i < rd; i++)
-            if (buf[i] == '\0') buf[i] = ' ';
-    buf[rd] = '\0';
-    return rd;
 }
 
 /* Examine a single file and emit findings. */
@@ -186,6 +269,7 @@ static void scan_one_file(ScanCtx *c, const char *path)
 
     PathLoc loc = path_classify(path);
     bool user_writable = path_is_user_writable(path);
+    bool self_image = is_current_scanner_image(path);
 
     /* ---- signature (PE only; non-PE files aren't Authenticode targets) ---- */
     SignVerdict sv = SIGN_UNKNOWN;
@@ -229,23 +313,36 @@ static void scan_one_file(ScanCtx *c, const char *path)
     }
 
     /* ---- FILE.SUSPICIOUS_CAPS ---- (PE in user-writable/temp) ---- */
-    if (is_pe && (user_writable || loc == PATHLOC_TEMP ||
+    if (!self_image && is_pe && (user_writable || loc == PATHLOC_TEMP ||
                   loc == PATHLOC_USER_WRITABLE)) {
         bool hook_net    = pe.imp_hook_api    && pe.imp_net_api;
         bool inject_net  = pe.imp_proc_inject_api && pe.imp_net_api;
         bool keystate_net = pe.imp_keystate_api && pe.imp_net_api;
-        if (hook_net || inject_net || keystate_net) {
+        bool clipboard_net = pe.imp_clipboard_api && pe.imp_net_api;
+        bool screen_net = pe.imp_screen_api && pe.imp_net_api;
+        bool media_net = pe.imp_media_capture_api && pe.imp_net_api;
+        bool cred_net = pe.imp_cred_api && pe.imp_net_api;
+        if (hook_net || inject_net || keystate_net || clipboard_net ||
+            screen_net || media_net || cred_net) {
             const char *combo = inject_net  ? "process-injection + network" :
                                 hook_net     ? "windows-hook + network" :
-                                               "keystate-capture + network";
+                                keystate_net ? "keystate-capture + network" :
+                                clipboard_net ? "clipboard-capture + network" :
+                                screen_net ? "screen-capture + network" :
+                                media_net ? "media-capture + network" :
+                                             "credential-api + network";
             bus_emit(c->bus, "FILE.SUSPICIOUS_CAPS", SEV_MED, 75, ACT_REVIEW,
                      0, path,
                      "Executable in user-writable path with dangerous imports",
-                     "imports: %s%s%s%s%s",
+                     "imports: %s%s%s%s%s%s%s%s%s",
                      combo,
                      pe.imp_crypt_api      ? " +crypt"   : "",
                      pe.imp_rawinput_api   ? " +rawinput": "",
                      pe.imp_hook_api       ? " +hook"    : "",
+                     pe.imp_clipboard_api  ? " +clipboard" : "",
+                     pe.imp_screen_api     ? " +screen" : "",
+                     pe.imp_media_capture_api ? " +media" : "",
+                     pe.imp_cred_api       ? " +cred-api" : "",
                      pe.looks_packed       ? " +packed"  : "");
         }
     }
@@ -265,33 +362,7 @@ static void scan_one_file(ScanCtx *c, const char *path)
     }
 
     /* ---- content checks: YARA-subset rules (raw bytes) + string IOC ---- */
-    if (c->yara || c->ioc) {
-        /* 1 MiB scan window; single-threaded scanner so a static is safe and
-         * avoids a per-file allocation. Read RAW (no NUL strip) for YARA. */
-        static char content[1u << 20];
-        size_t got = read_file_text(path, content, sizeof content, false);
-        if (got > 0) {
-            char rulename[80];
-            if (c->yara &&
-                yara_scan(c->yara, (const unsigned char *)content, got,
-                          rulename, sizeof rulename)) {
-                bus_emit(c->bus, "FILE.YARA_MATCH", SEV_HIGH, 85, ACT_QUARANTINE,
-                         0, path, "File content matches a YARA rule",
-                         "matched YARA rule '%s'", rulename);
-            }
-            /* the string IOC matcher is NUL-terminated; strip embedded NULs. */
-            if (c->ioc) {
-                for (size_t i = 0; i < got; i++)
-                    if (content[i] == '\0') content[i] = ' ';
-                content[got] = '\0';
-                if (ioc_match_string(c->ioc, content)) {
-                    bus_emit(c->bus, "FILE.IOC_STRING", SEV_HIGH, 90, ACT_QUARANTINE,
-                             0, path, "File content matches a known-bad string IOC",
-                             "matched a loaded indicator (string/C2 domain)");
-                }
-            }
-        }
-    }
+    scan_content_indicators(c, path, is_pe);
 }
 
 /* Recurse into a directory. depth bounds the descent; reparse points are

@@ -1,0 +1,6 @@
+interface:
+  display_name: "SentinelC Incident Response"
+  short_description: "Run and verify SentinelC cleanup"
+  default_prompt: "Use $sentinelc-incident-response to run SentinelC, analyze findings, clean safely, and verify."
+policy:
+  allow_implicit_invocation: true

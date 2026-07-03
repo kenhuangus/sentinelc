@@ -7,9 +7,8 @@
  *
  *   1. Built-in, research-based auto-suppression. The noisy heuristic rules
  *      ("looks odd: unsigned / user-writable / RWX / installs a hook") are
- *      suppressed when the offending binary is VALIDLY Authenticode-signed by
- *      Microsoft or a curated trusted publisher. That is the JIT-engine and
- *      signed-service false-positive class. High-signal rules (encoded
+ *      suppressed only when the offending binary is validly Microsoft-signed.
+ *      High-signal rules (encoded
  *      PowerShell, LOLBIN abuse, credential access, reflective PE) are NEVER
  *      auto-suppressed -- a validly signed powershell.exe running an encoded
  *      command IS the attack.
@@ -79,6 +78,44 @@ static bool ci_contains_local(const char *hay, const char *needle)
         if (_strnicmp(p, needle, nl) == 0)
             return true;
     }
+    return false;
+}
+
+static bool fullpath_equal_local(const char *a, const char *b)
+{
+    if (!a || !b || !a[0] || !b[0])
+        return false;
+
+    char fa[SC_MAX_PATH], fb[SC_MAX_PATH];
+    DWORD na = GetFullPathNameA(a, sizeof(fa), fa, NULL);
+    DWORD nb = GetFullPathNameA(b, sizeof(fb), fb, NULL);
+    if (na == 0 || na >= sizeof(fa) || nb == 0 || nb >= sizeof(fb))
+        return _stricmp(a, b) == 0;
+    fa[sizeof(fa) - 1] = '\0';
+    fb[sizeof(fb) - 1] = '\0';
+    return _stricmp(fa, fb) == 0;
+}
+
+static bool finding_is_current_scanner(const Finding *f,
+                                       const char *bin, bool have_bin)
+{
+    if (!f)
+        return false;
+
+    DWORD self_pid = GetCurrentProcessId();
+    if (f->pid && f->pid == self_pid)
+        return true;
+
+    char self[SC_MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, self, sizeof(self));
+    if (n == 0 || n >= sizeof(self))
+        return false;
+    self[sizeof(self) - 1] = '\0';
+
+    if (have_bin && fullpath_equal_local(self, bin))
+        return true;
+    if (f->target[0] && fullpath_equal_local(self, f->target))
+        return true;
     return false;
 }
 
@@ -162,11 +199,11 @@ done:
 /* layer 1: built-in research-based auto-suppression                   */
 /* ------------------------------------------------------------------ */
 
-/* Heuristic rules whose dominant false-positive cause is "validly signed
- * code that legitimately does something that looks odd" (JIT RWX memory,
+/* Heuristic rules whose dominant false-positive cause is Microsoft-signed code
+ * that legitimately does something that looks odd (JIT RWX memory,
  * a signed service listening, an input app installing a keyboard hook,
- * a signed app shipped under AppData). These are safe to auto-suppress
- * when the binary carries a valid signature. Deliberately excludes
+ * a signed app shipped under AppData). These are safe to auto-suppress only
+ * when the binary chains to Microsoft. Deliberately excludes
  * PROC.ENCODED_CMD, PROC.LOLBIN_ARGS, MEM.REFLECTIVE_PE, PROC.HOLLOWED,
  * EVADE.*, CRED.*, PERSIST.* and RK.* -- those are dangerous precisely
  * BECAUSE attackers run them through signed binaries. */
@@ -187,26 +224,6 @@ static bool rule_is_signed_noise(const char *rule_id)
     return false;
 }
 
-/* Publishers we treat as trusted for layer-1 auto-suppression of the noisy
- * rules. Microsoft is handled separately via SIGN_SIGNED_MS. Substring,
- * case-insensitive against the Authenticode subject. */
-static bool signer_is_trusted(const char *signer)
-{
-    if (!signer || !signer[0])
-        return false;
-    static const char *pubs[] = {
-        "Microsoft", "Google", "Mozilla", "Oracle", "Adobe",
-        "Dell", "Intel", "NVIDIA", "Realtek", "Logitech", "Lenovo",
-        "Apple", "Zoom", "Valve", "Discord", "Brave Software",
-        "Kingsoft", "Hewlett", "ASUSTeK", "Synaptics",
-        NULL
-    };
-    for (int i = 0; pubs[i]; ++i)
-        if (ci_contains_local(signer, pubs[i]))
-            return true;
-    return false;
-}
-
 /* ------------------------------------------------------------------ */
 /* resolve the binary a finding is about                               */
 /* ------------------------------------------------------------------ */
@@ -219,8 +236,7 @@ static bool finding_binary(const ScanCtx *c, const Finding *f, char *out, size_t
     if (f->pid && c && c->procs) {
         ProcRec *pr = proctable_find(c->procs, f->pid);
         if (pr && pr->image_path[0]) {
-            strncpy(out, pr->image_path, cap - 1);
-            out[cap - 1] = '\0';
+            snprintf(out, cap, "%s", pr->image_path);
             return true;
         }
     }
@@ -229,8 +245,7 @@ static bool finding_binary(const ScanCtx *c, const Finding *f, char *out, size_t
         DWORD attr = GetFileAttributesA(f->target);
         if (attr != INVALID_FILE_ATTRIBUTES &&
             !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
-            strncpy(out, f->target, cap - 1);
-            out[cap - 1] = '\0';
+            snprintf(out, cap, "%s", f->target);
             return true;
         }
     }
@@ -247,6 +262,9 @@ static const char *should_suppress(const ScanCtx *c, const Finding *f)
 {
     char bin[SC_MAX_PATH];
     bool have_bin = finding_binary(c, f, bin, sizeof bin);
+
+    if (finding_is_current_scanner(f, have_bin ? bin : NULL, have_bin))
+        return "auto:self";
 
     /* lazy-computed, cached within this call */
     bool       sig_done = false; SignVerdict sig = SIGN_UNKNOWN;
@@ -285,8 +303,6 @@ static const char *should_suppress(const ScanCtx *c, const Finding *f)
         if (!sig_done) { sig = sign_verify(bin, signer, sizeof signer); sig_done = true; }
         if (sig == SIGN_SIGNED_MS)
             return "auto:signed-microsoft";
-        if (sig == SIGN_SIGNED && signer_is_trusted(signer))
-            return "auto:signed-trusted";
     }
 
     return NULL;
@@ -368,10 +384,6 @@ void suppress_apply(ScanCtx *c)
     if (!c || !c->bus)
         return;
     FindingBus *b = c->bus;
-
-    /* If auto-fp is off and no suppress.txt entries, nothing to do. */
-    if ((!c->cfg || c->cfg->no_auto_fp) && g_supp.count == 0)
-        return;
 
     EnterCriticalSection(&b->lock);
 

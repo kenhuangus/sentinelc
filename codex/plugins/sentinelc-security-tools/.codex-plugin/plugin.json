@@ -1,0 +1,37 @@
+{
+  "name": "sentinelc-security-tools",
+  "version": "0.1.0",
+  "description": "Codex plugin for SentinelC scan, triage, cleanup, and verification workflows.",
+  "author": {
+    "name": "SentinelC Project",
+    "url": "https://github.com/kenhuangus/sentinelc"
+  },
+  "homepage": "https://github.com/kenhuangus/sentinelc",
+  "repository": "https://github.com/kenhuangus/sentinelc",
+  "license": "MIT",
+  "keywords": [
+    "security",
+    "malware",
+    "incident-response",
+    "windows",
+    "sentinelc"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "SentinelC Security Tools",
+    "shortDescription": "Run SentinelC triage and cleanup safely.",
+    "longDescription": "SentinelC Security Tools bundles a Codex skill for evidence-preserving Windows malware triage, offline-like scans, Defender exclusion review, safe cleanup, quarantine, and verification.",
+    "developerName": "SentinelC Project",
+    "category": "Security",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use SentinelC to run an offline-like scan.",
+      "Analyze this SentinelC JSON report.",
+      "Create a safe cleanup and verification plan."
+    ],
+    "brandColor": "#2563EB"
+  }
+}

@@ -110,6 +110,11 @@ typedef struct {
     bool integrity_check;      /* --integrity : diff vs baseline */
     char integrity_roots[4096];/* --integrity-roots "A;B;C" (semicolon list); empty => defaults */
     char baseline_file[SC_MAX_PATH]; /* --baseline-file PATH; empty => default location */
+
+    /* offline-like snapshot hunting (no reboot; uses VSS when elevated) */
+    bool offline_like;         /* --offline-like : VSS/offline-hive/rootkit-style pass */
+    int  offline_passes;       /* --offline-passes N : repeat snapshot hunting */
+    char offline_roots[4096];  /* --offline-roots "A;B;C" live roots mapped into shadow */
 } Config;
 
 /* ---- cached process record (populated by scan_process, read by others) ---- */
@@ -169,6 +174,7 @@ void scan_integrity(ScanCtx *c); /* scan_integrity.c -- Merkle FIM baseline/chec
 void scan_creds(ScanCtx *c);     /* scan_creds.c -- credential-access detection */
 void scan_memscan(ScanCtx *c);   /* scan_memscan.c -- in-memory injected-code scan */
 void scan_evade(ScanCtx *c);     /* scan_evade.c -- AMSI/ETW tamper detection */
+void scan_offline_like(ScanCtx *c); /* scan_offline.c -- VSS/offline-hive hunting */
 
 /* correlation pass: promotes multi-signal artifacts. engine.c */
 void correlate(ScanCtx *c);
@@ -196,6 +202,10 @@ typedef struct {
     bool   imp_hook_api;        /* SetWindowsHookEx etc */
     bool   imp_keystate_api;    /* GetAsyncKeyState/GetKeyState */
     bool   imp_rawinput_api;    /* Register/GetRawInputData */
+    bool   imp_clipboard_api;   /* clipboard read/listen APIs */
+    bool   imp_screen_api;      /* screenshot / desktop capture APIs */
+    bool   imp_media_capture_api; /* mic/camera capture APIs */
+    bool   imp_cred_api;        /* Cred/Vault/DPAPI secret-read APIs */
     bool   imp_net_api;         /* ws2_32 connect/send/WSASocket */
     bool   imp_proc_inject_api; /* WriteProcessMemory/CreateRemoteThread */
     bool   imp_crypt_api;       /* crypt/ransomware-ish */
@@ -204,6 +214,17 @@ typedef struct {
 
 /* Analyze a file on disk. Returns false if not a readable PE. */
 bool pe_analyze(const char *path, PeInfo *out);
+
+typedef struct {
+    uint64_t calls;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t stores;
+    uint64_t entries;
+    bool enabled;
+} PeCacheStats;
+
+void pe_cache_stats(PeCacheStats *out);
 
 /* Shannon entropy of a buffer, 0..8. (heur.c) */
 double shannon_entropy(const unsigned char *buf, size_t len);
@@ -220,11 +241,27 @@ typedef enum {
 } SignVerdict;
 
 const char *sign_name(SignVerdict v);            /* util.c */
-/* Verify a file's signature (embedded + catalog). Result cached by path+mtime.
- * signer_out (may be NULL) receives the signer subject (<= SC_NAME_LEN). */
+/* Verify a file's signature (embedded + catalog). Results are cached
+ * in-process by path+size+mtime, and persisted with a SHA-256 content key when
+ * the ProgramData cache directory can be secured. signer_out (may be NULL)
+ * receives the signer subject (<= SC_NAME_LEN). */
 SignVerdict sign_verify(const char *path, char *signer_out, size_t signer_cap);
 void        sign_cache_init(void);
 void        sign_cache_free(void);
+
+typedef struct {
+    uint64_t calls;
+    uint64_t memory_hits;
+    uint64_t persistent_hits;
+    uint64_t verifications;
+    uint64_t persistent_hash_checks;
+    uint64_t persistent_entries_loaded;
+    uint64_t persistent_entries_saved;
+    uint64_t entries;
+    bool persistent_enabled;
+} SignCacheStats;
+
+void        sign_cache_stats(SignCacheStats *out);
 
 /* =====================================================================
  *  Heuristics / path classification / allowlist (heur.c)

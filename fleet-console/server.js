@@ -20,27 +20,71 @@ const SEVERITIES = ['critical', 'high', 'medium', 'low', 'info'];
 // ---------------------------------------------------------------------------
 // Token resolution: env > config.json > generate+persist
 // ---------------------------------------------------------------------------
-function resolveToken() {
-  if (process.env.SENTINELC_FLEET_TOKEN && process.env.SENTINELC_FLEET_TOKEN.trim()) {
-    return { token: process.env.SENTINELC_FLEET_TOKEN.trim(), source: 'env' };
-  }
-  try {
-    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-    if (cfg && typeof cfg.token === 'string' && cfg.token.trim()) {
-      return { token: cfg.token.trim(), source: 'config.json' };
+function normalizeHostTokens(value) {
+  const out = new Map();
+  if (!value) return out;
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    for (const [host, token] of Object.entries(value)) {
+      const safe = sanitizeHostname(host);
+      if (safe && typeof token === 'string' && token.trim()) {
+        out.set(safe.toLowerCase(), token.trim());
+      }
     }
+  }
+  return out;
+}
+
+function parseHostTokensEnv(value) {
+  if (!value || !value.trim()) return new Map();
+  try {
+    return normalizeHostTokens(JSON.parse(value));
+  } catch (_) {
+    const out = new Map();
+    for (const pair of value.split(',')) {
+      const idx = pair.indexOf('=');
+      if (idx <= 0) continue;
+      const safe = sanitizeHostname(pair.slice(0, idx).trim());
+      const token = pair.slice(idx + 1).trim();
+      if (safe && token) out.set(safe.toLowerCase(), token);
+    }
+    return out;
+  }
+}
+
+function mergeHostTokens(a, b) {
+  const out = new Map(a);
+  for (const [host, token] of b.entries()) out.set(host, token);
+  return out;
+}
+
+function resolveToken() {
+  let cfg = {};
+  try {
+    cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
   } catch (_) { /* missing/unreadable config -> generate */ }
+
+  const hostTokens = mergeHostTokens(
+    normalizeHostTokens(cfg.hostTokens),
+    parseHostTokensEnv(process.env.SENTINELC_FLEET_HOST_TOKENS)
+  );
+
+  if (process.env.SENTINELC_FLEET_TOKEN && process.env.SENTINELC_FLEET_TOKEN.trim()) {
+    return { token: process.env.SENTINELC_FLEET_TOKEN.trim(), hostTokens, source: 'env' };
+  }
+  if (cfg && typeof cfg.token === 'string' && cfg.token.trim()) {
+    return { token: cfg.token.trim(), hostTokens, source: 'config.json' };
+  }
 
   const token = crypto.randomBytes(24).toString('hex');
   try {
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify({ token }, null, 2) + '\n', { mode: 0o600 });
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify({ token, hostTokens: {} }, null, 2) + '\n', { mode: 0o600 });
   } catch (e) {
     console.error('WARN: could not write config.json:', e.message);
   }
-  return { token, source: 'generated' };
+  return { token, hostTokens, source: 'generated' };
 }
 
-const { token: AUTH_TOKEN, source: TOKEN_SOURCE } = resolveToken();
+const { token: AUTH_TOKEN, hostTokens: HOST_TOKENS, source: TOKEN_SOURCE } = resolveToken();
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -112,11 +156,24 @@ function timingSafeEqual(a, b) {
   return crypto.timingSafeEqual(ba, bb);
 }
 
-function checkAuth(req) {
+function bearerToken(req) {
   const h = req.headers['authorization'] || '';
   const m = /^Bearer\s+(.+)$/i.exec(h);
-  if (!m) return false;
-  return timingSafeEqual(m[1].trim(), AUTH_TOKEN);
+  return m ? m[1].trim() : '';
+}
+
+function checkAuth(req) {
+  const token = bearerToken(req);
+  return token ? timingSafeEqual(token, AUTH_TOKEN) : false;
+}
+
+function ingestAuthStatus(req, safeHostname) {
+  const token = bearerToken(req);
+  if (!token) return { ok: false, status: 401, error: 'unauthorized' };
+  const expected = HOST_TOKENS.get(String(safeHostname).toLowerCase());
+  if (!expected) return { ok: false, status: 403, error: 'host token not configured' };
+  if (!timingSafeEqual(token, expected)) return { ok: false, status: 401, error: 'unauthorized' };
+  return { ok: true };
 }
 
 function sendJson(res, status, obj) {
@@ -186,9 +243,8 @@ function listHostRecords() {
 // Route handlers
 // ---------------------------------------------------------------------------
 async function handleIngest(req, res) {
-  if (!checkAuth(req)) {
-    return sendJson(res, 401, { ok: false, error: 'unauthorized' });
-  }
+  if (!bearerToken(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
+
   let raw;
   try {
     raw = await readBody(req, MAX_BODY);
@@ -208,6 +264,8 @@ async function handleIngest(req, res) {
   if (!safe) {
     return sendJson(res, 400, { ok: false, error: 'invalid hostname' });
   }
+  const auth = ingestAuthStatus(req, safe);
+  if (!auth.ok) return sendJson(res, auth.status, { ok: false, error: auth.error });
 
   const findings = extractFindings(payload);
   const counts = countSeverities(findings);
@@ -251,7 +309,13 @@ function handleHosts(req, res) {
 }
 
 function handleHost(req, res, name) {
-  const safe = sanitizeHostname(decodeURIComponent(name));
+  let decoded;
+  try {
+    decoded = decodeURIComponent(name);
+  } catch (_) {
+    return sendJson(res, 400, { ok: false, error: 'invalid hostname' });
+  }
+  const safe = sanitizeHostname(decoded);
   if (!safe) return sendJson(res, 400, { ok: false, error: 'invalid hostname' });
   const rec = loadHostRecord(safe);
   if (!rec) return sendJson(res, 404, { ok: false, error: 'not found' });
@@ -294,10 +358,12 @@ const server = http.createServer((req, res) => {
     return handleIngest(req, res);
   }
   if (method === 'GET' && pathname === '/api/hosts') {
+    if (!checkAuth(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
     return handleHosts(req, res);
   }
   const hostMatch = /^\/api\/host\/([^/]+)$/.exec(pathname);
   if (method === 'GET' && hostMatch) {
+    if (!checkAuth(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
     return handleHost(req, res, hostMatch[1]);
   }
   if (method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
@@ -312,9 +378,10 @@ server.listen(PORT, HOST, () => {
   console.log('  SentinelC Fleet Console');
   console.log('  -----------------------');
   console.log('  URL:    ' + u);
-  console.log('  Token:  ' + AUTH_TOKEN + '  (source: ' + TOKEN_SOURCE + ')');
+  console.log('  Console token:  ' + AUTH_TOKEN + '  (source: ' + TOKEN_SOURCE + ')');
+  console.log('  Host tokens:    ' + HOST_TOKENS.size + ' configured');
   console.log('  Data:   ' + DATA_DIR);
   console.log('');
-  console.log('  Submit a scan with the Authorization: Bearer <token> header.');
+  console.log('  Submit scans with a per-host Authorization: Bearer <host-token> header.');
   console.log('');
 });

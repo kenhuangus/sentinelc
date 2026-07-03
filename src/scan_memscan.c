@@ -37,9 +37,36 @@
 #define MS_WALLCLOCK_MS   30000         /* whole-module time budget            */
 #define MS_MAX_FINDINGS   256           /* stop emitting past this (sanity)    */
 
+static bool is_lolbin_host(const ProcRec *r)
+{
+    if (!r)
+        return false;
+    char name[SC_NAME_LEN] = {0};
+    if (r->name[0]) {
+        snprintf(name, sizeof(name), "%s", r->name);
+    } else if (r->image_path[0]) {
+        base_name(r->image_path, name, sizeof(name));
+    }
+    if (!name[0])
+        return false;
+
+    static const char *hosts[] = {
+        "powershell.exe", "pwsh.exe", "wscript.exe", "cscript.exe",
+        "mshta.exe", "rundll32.exe", "regsvr32.exe", "wmic.exe",
+        "msbuild.exe", "installutil.exe", "regasm.exe", "regsvcs.exe",
+        "certutil.exe", "bitsadmin.exe", "msiexec.exe", NULL
+    };
+    for (int i = 0; hosts[i]; i++)
+        if (_stricmp(name, hosts[i]) == 0)
+            return true;
+    return false;
+}
+
 /* Is this process worth the cost of a memory deep-scan? Validly-signed images
- * are exonerated (their RWX is JIT, not injection) UNLESS already flagged with
- * suspicious memory. Everything unsigned/unknown/user-writable is in scope. */
+ * are exonerated (their RWX is often JIT or normal runtime behavior) UNLESS
+ * already flagged with suspicious memory or they are signed Windows scripting /
+ * LOLBin hosts commonly abused for in-memory payloads. Everything unsigned,
+ * unknown, or user-writable remains in scope. */
 static bool worth_scanning(const ProcRec *r)
 {
     if (!r || r->pid == 0 || r->pid == 4)
@@ -48,7 +75,7 @@ static bool worth_scanning(const ProcRec *r)
         return false;
     bool validly_signed = (r->sign_state == SIGN_SIGNED ||
                            r->sign_state == SIGN_SIGNED_MS);
-    if (validly_signed && !r->suspicious_mem)
+    if (validly_signed && !r->suspicious_mem && !is_lolbin_host(r))
         return false;
     return true;
 }

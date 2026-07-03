@@ -30,6 +30,7 @@
 #define RK_NT_BUF_START      (64 * 1024)
 #define RK_NT_BUF_MAX        (32 * 1024 * 1024)
 #define RK_DIR_BUF           (64 * 1024)
+#define RK_PROC_CONFIRM_MS   350
 
 /* ============================================================
  *  Minimal ntdll types -- declared here, not in a public SDK.
@@ -330,12 +331,9 @@ static const char *src_name(int i)
     }
 }
 
-/* ============================================================
- *  1. PROCESS CROSS-VIEW
- * ============================================================ */
-static void cross_view_processes(ScanCtx *c, const NtApi *n)
+static int collect_process_sources(ScanCtx *c, const NtApi *n,
+                                   PidSet src[4], bool note_limits)
 {
-    PidSet src[4];
     for (int i = 0; i < 4; i++)
         pidset_init(&src[i]);
 
@@ -348,13 +346,57 @@ static void cross_view_processes(ScanCtx *c, const NtApi *n)
     for (int i = 0; i < 4; i++) {
         if (src[i].ok)
             ok_sources++;
-        else
+        else if (note_limits)
             ctx_note_limit(c, "rootkit: process source %s unavailable",
                            src_name(i));
-        if (src[i].truncated)
+        if (src[i].truncated && note_limits)
             ctx_note_limit(c, "rootkit: process source %s truncated at %d pids",
                            src_name(i), RK_MAX_PIDS);
     }
+    return ok_sources;
+}
+
+static void source_diff_strings(PidSet src[4], DWORD pid, int *saw,
+                                int *missed, char *saw_str, size_t saw_cap,
+                                char *miss_str, size_t miss_cap)
+{
+    if (saw) *saw = 0;
+    if (missed) *missed = 0;
+    if (saw_str && saw_cap) saw_str[0] = '\0';
+    if (miss_str && miss_cap) miss_str[0] = '\0';
+
+    for (int i = 0; i < 4; i++) {
+        if (!src[i].ok)
+            continue;
+        bool has = pidset_has(&src[i], pid);
+        int *counter = has ? saw : missed;
+        char *buf = has ? saw_str : miss_str;
+        size_t cap = has ? saw_cap : miss_cap;
+        if (counter)
+            (*counter)++;
+        if (buf && cap > 0) {
+            if (buf[0])
+                strncat(buf, ",", cap - strlen(buf) - 1);
+            strncat(buf, src_name(i), cap - strlen(buf) - 1);
+        }
+    }
+}
+
+static void union_sources(PidSet *uni, PidSet src[4])
+{
+    pidset_init(uni);
+    for (int i = 0; i < 4; i++)
+        for (size_t j = 0; j < src[i].count; j++)
+            pidset_add(uni, src[i].pids[j]);
+}
+
+/* ============================================================
+ *  1. PROCESS CROSS-VIEW
+ * ============================================================ */
+static void cross_view_processes(ScanCtx *c, const NtApi *n)
+{
+    PidSet src[4];
+    int ok_sources = collect_process_sources(c, n, src, true);
     if (ok_sources < 2) {
         ctx_note_limit(c, "rootkit: <2 process sources available, "
                           "cross-view skipped");
@@ -363,37 +405,32 @@ static void cross_view_processes(ScanCtx *c, const NtApi *n)
 
     /* Build the union of all PIDs any source saw. */
     PidSet uni;
-    pidset_init(&uni);
-    for (int i = 0; i < 4; i++)
-        for (size_t j = 0; j < src[i].count; j++)
-            pidset_add(&uni, src[i].pids[j]);
+    union_sources(&uni, src);
+
+    /* A single cross-view pass is vulnerable to normal process churn. Confirm
+     * discrepancies against a second snapshot before emitting a rootkit lead. */
+    Sleep(RK_PROC_CONFIRM_MS);
+    PidSet src2[4];
+    int ok_sources2 = collect_process_sources(c, n, src2, false);
+    if (ok_sources2 < 2) {
+        ctx_note_limit(c, "rootkit: confirmation snapshot had <2 process "
+                          "sources available; hidden-process cross-view skipped");
+        return;
+    }
 
     int emitted = 0;
     for (size_t j = 0; j < uni.count && emitted < RK_MAX_HIDDEN_PROC; j++) {
         DWORD pid = uni.pids[j];
 
         /* Count how many *available* sources saw / missed this pid. */
-        int saw = 0, missed = 0;
+        int saw = 0, missed = 0, saw2 = 0, missed2 = 0;
         char saw_str[160] = {0};
         char miss_str[160] = {0};
-        for (int i = 0; i < 4; i++) {
-            if (!src[i].ok)
-                continue;
-            if (pidset_has(&src[i], pid)) {
-                saw++;
-                if (saw_str[0])
-                    strncat(saw_str, ",", sizeof(saw_str) - strlen(saw_str) - 1);
-                strncat(saw_str, src_name(i),
-                        sizeof(saw_str) - strlen(saw_str) - 1);
-            } else {
-                missed++;
-                if (miss_str[0])
-                    strncat(miss_str, ",",
-                            sizeof(miss_str) - strlen(miss_str) - 1);
-                strncat(miss_str, src_name(i),
-                        sizeof(miss_str) - strlen(miss_str) - 1);
-            }
-        }
+        char saw2_str[160] = {0};
+        char miss2_str[160] = {0};
+        source_diff_strings(src, pid, &saw, &missed,
+                            saw_str, sizeof(saw_str),
+                            miss_str, sizeof(miss_str));
 
         /* Only interesting if at least one source saw it AND at least one
          * available source missed it. A pid every source missed isn't in the
@@ -401,20 +438,30 @@ static void cross_view_processes(ScanCtx *c, const NtApi *n)
         if (saw == 0 || missed == 0)
             continue;
 
-        /* Filter the unavoidable enumeration race: re-confirm the process
-         * truly exists right now before crying rootkit. */
+        source_diff_strings(src2, pid, &saw2, &missed2,
+                            saw2_str, sizeof(saw2_str),
+                            miss2_str, sizeof(miss2_str));
+        if (saw2 == 0 || missed2 == 0)
+            continue;
+
+        /* Filter the unavoidable enumeration race after the confirmation
+         * snapshot: the process must still exist now before crying rootkit. */
         if (!pid_truly_alive(pid))
             continue;
 
         bus_emit(c->bus, "RK.HIDDEN_PROC", SEV_CRIT, 70, ACT_REVIEW, pid,
                  "pid hidden from a list API",
                  "PID hidden in process cross-view",
-                 "pid %lu seen by [%s] but missing from [%s]; "
+                 "pid %lu showed a stable cross-view mismatch across two "
+                 "snapshots %d ms apart: pass1 seen by [%s] missing from [%s]; "
+                 "pass2 seen by [%s] missing from [%s]. "
                  "OpenProcess/GetExitCodeProcess confirms it is STILL_ACTIVE. "
-                 "A list API is hiding a live process -- user-mode hooking. "
+                 "A list API is hiding a live process -- possible user-mode "
+                 "hooking. "
                  "(NOTE: a kernel DKOM rootkit can hide a process from ALL "
                  "user-mode APIs and would NOT be caught here.)",
-                 (unsigned long)pid, saw_str, miss_str);
+                 (unsigned long)pid, RK_PROC_CONFIRM_MS,
+                 saw_str, miss_str, saw2_str, miss2_str);
         emitted++;
     }
     if (emitted >= RK_MAX_HIDDEN_PROC)

@@ -69,6 +69,64 @@ static bool sign_is_trusted(int sstate)
     return sstate == SIGN_SIGNED_MS || sstate == SIGN_SIGNED;
 }
 
+static int conf_clamp(int v)
+{
+    if (v < 0)   return 0;
+    if (v > 100) return 100;
+    return v;
+}
+
+static void append_tag(char *dst, size_t cap, const char *tag)
+{
+    if (!dst || cap == 0 || !tag || !tag[0])
+        return;
+    size_t used = strlen(dst);
+    if (used + 1 >= cap)
+        return;
+    if (used) {
+        dst[used++] = ' ';
+        dst[used] = '\0';
+    }
+    strncat(dst, tag, cap - strlen(dst) - 1);
+}
+
+static bool pe_keyboard_capture(const PeInfo *pe)
+{
+    return pe && (pe->imp_hook_api || pe->imp_keystate_api ||
+                  pe->imp_rawinput_api);
+}
+
+static int capture_family_count(const PeInfo *pe)
+{
+    if (!pe)
+        return 0;
+    int n = 0;
+    if (pe_keyboard_capture(pe)) n++;
+    if (pe->imp_clipboard_api) n++;
+    if (pe->imp_screen_api) n++;
+    if (pe->imp_media_capture_api) n++;
+    if (pe->imp_cred_api) n++;
+    return n;
+}
+
+static void capture_tags(const PeInfo *pe, char *out, size_t cap)
+{
+    if (!out || cap == 0)
+        return;
+    out[0] = '\0';
+    if (!pe)
+        return;
+    if (pe->imp_hook_api) append_tag(out, cap, "hook");
+    if (pe->imp_keystate_api) append_tag(out, cap, "keystate");
+    if (pe->imp_rawinput_api) append_tag(out, cap, "rawinput");
+    if (pe->imp_clipboard_api) append_tag(out, cap, "clipboard");
+    if (pe->imp_screen_api) append_tag(out, cap, "screen");
+    if (pe->imp_media_capture_api) append_tag(out, cap, "media");
+    if (pe->imp_cred_api) append_tag(out, cap, "cred-api");
+    if (out[0] == '\0')
+        append_tag(out, cap, "none");
+}
+
 static void eval_proc_caps(ScanCtx *c, ProcRec *pr)
 {
     if (!pr || !pr->image_path[0])
@@ -87,6 +145,13 @@ static void eval_proc_caps(ScanCtx *c, ProcRec *pr)
     bool user_writable = path_is_user_writable(img);
     bool unsigned_img  = (sstate == SIGN_UNSIGNED || sstate == SIGN_INVALID);
     bool ms_signed     = sign_is_ms(sstate);
+    bool trusted_img   = sign_is_trusted(sstate);
+    bool masquerade    = name_is_masquerade(img);
+    bool high_risk_owner = unsigned_img || masquerade ||
+                           (pe.looks_packed && !trusted_img) ||
+                           (user_writable && !trusted_img);
+    bool egress        = pe.imp_net_api || pe.imp_crypt_api;
+    int  families      = capture_family_count(&pe);
 
     char target[SC_MAX_PATH];
     copy_target(target, sizeof(target), img);
@@ -151,6 +216,143 @@ static void eval_proc_caps(ScanCtx *c, ProcRec *pr)
                  "sign=%s; image=%s",
                  (unsigned long)pr->pid, name,
                  sign_name((SignVerdict)sstate), img);
+    }
+
+    /* ---- SPY.MULTI_CAPTURE: more than one capture family + egress ---- */
+    if (families >= 2 && egress && !ms_signed && !is_known_input_app(name) &&
+        (high_risk_owner || !trusted_img || families >= 3)) {
+        char caps[160];
+        capture_tags(&pe, caps, sizeof(caps));
+
+        int conf = 68;
+        if (families >= 3) conf += 10;
+        if (unsigned_img)  conf += 12;
+        if (user_writable) conf += 8;
+        if (masquerade)    conf += 8;
+        if (pe.looks_packed) conf += 6;
+        if (trusted_img)   conf -= 20;
+        conf = conf_clamp(conf);
+
+        if (conf >= 50) {
+            Severity sev = (conf >= 85 && high_risk_owner) ? SEV_CRIT : SEV_HIGH;
+            bus_emit(c->bus, "SPY.MULTI_CAPTURE", sev, conf, ACT_REVIEW,
+                     pr->pid, target,
+                     "Process combines multiple spyware capture capabilities",
+                     "pid %lu (%s) imports capture APIs [%s] plus %s%s; "
+                     "families=%d; sign=%s; image=%s",
+                     (unsigned long)pr->pid, name, caps,
+                     pe.imp_net_api ? "net " : "",
+                     pe.imp_crypt_api ? "crypt " : "",
+                     families, sign_name((SignVerdict)sstate), img);
+        }
+    }
+
+    /* ---- SPY.CLIPBOARD: clipboard theft shape ---- */
+    if (pe.imp_clipboard_api && !ms_signed &&
+        (high_risk_owner || (egress && !trusted_img))) {
+        int conf = 58;
+        if (egress)        conf += 8;
+        if (unsigned_img)  conf += 12;
+        if (user_writable) conf += 8;
+        if (masquerade)    conf += 8;
+        if (pe.looks_packed) conf += 6;
+        if (trusted_img)   conf -= 18;
+        conf = conf_clamp(conf);
+
+        if (conf >= 50) {
+            bus_emit(c->bus, "SPY.CLIPBOARD", SEV_MED, conf, ACT_REVIEW,
+                     pr->pid, target,
+                     "Process can read clipboard contents with other risk signals",
+                     "pid %lu (%s) imports clipboard APIs and has %s%s%s%s; "
+                     "sign=%s; image=%s",
+                     (unsigned long)pr->pid, name,
+                     pe.imp_net_api ? "net " : "",
+                     pe.imp_crypt_api ? "crypt " : "",
+                     user_writable ? "user-writable-path " : "",
+                     unsigned_img ? "unsigned/invalid-signature" : "",
+                     sign_name((SignVerdict)sstate), img);
+        }
+    }
+
+    /* ---- SPY.SCREEN_CAPTURE: screenshot / desktop capture shape ---- */
+    if (pe.imp_screen_api && (high_risk_owner || (egress && !trusted_img)) &&
+        !ms_signed && !is_known_input_app(name)) {
+        int conf = 56;
+        if (egress)        conf += 8;
+        if (unsigned_img)  conf += 12;
+        if (user_writable) conf += 8;
+        if (masquerade)    conf += 8;
+        if (pe.looks_packed) conf += 6;
+        if (trusted_img)   conf -= 20;
+        conf = conf_clamp(conf);
+
+        if (conf >= 50) {
+            bus_emit(c->bus, "SPY.SCREEN_CAPTURE", SEV_MED, conf, ACT_REVIEW,
+                     pr->pid, target,
+                     "Process can capture the screen with other risk signals",
+                     "pid %lu (%s) imports screenshot/desktop-capture APIs and "
+                     "has %s%s%s%s; sign=%s; image=%s",
+                     (unsigned long)pr->pid, name,
+                     pe.imp_net_api ? "net " : "",
+                     pe.imp_crypt_api ? "crypt " : "",
+                     user_writable ? "user-writable-path " : "",
+                     unsigned_img ? "unsigned/invalid-signature" : "",
+                     sign_name((SignVerdict)sstate), img);
+        }
+    }
+
+    /* ---- SPY.MEDIA_CAPTURE: microphone/camera capture shape ---- */
+    if (pe.imp_media_capture_api && !ms_signed &&
+        (high_risk_owner || (egress && !trusted_img))) {
+        int conf = 56;
+        if (egress)        conf += 8;
+        if (unsigned_img)  conf += 12;
+        if (user_writable) conf += 8;
+        if (masquerade)    conf += 8;
+        if (pe.looks_packed) conf += 6;
+        if (trusted_img)   conf -= 20;
+        conf = conf_clamp(conf);
+
+        if (conf >= 50) {
+            bus_emit(c->bus, "SPY.MEDIA_CAPTURE", SEV_MED, conf, ACT_REVIEW,
+                     pr->pid, target,
+                     "Process can capture microphone/camera input with risk signals",
+                     "pid %lu (%s) imports media capture APIs and has %s%s%s%s; "
+                     "sign=%s; image=%s",
+                     (unsigned long)pr->pid, name,
+                     pe.imp_net_api ? "net " : "",
+                     pe.imp_crypt_api ? "crypt " : "",
+                     user_writable ? "user-writable-path " : "",
+                     unsigned_img ? "unsigned/invalid-signature" : "",
+                     sign_name((SignVerdict)sstate), img);
+        }
+    }
+
+    /* ---- SPY.CRED_API: Vault/Cred/DPAPI secret-access capability ---- */
+    if (pe.imp_cred_api && !ms_signed &&
+        (high_risk_owner || (egress && !trusted_img))) {
+        int conf = 62;
+        if (egress)        conf += 8;
+        if (unsigned_img)  conf += 12;
+        if (user_writable) conf += 8;
+        if (masquerade)    conf += 8;
+        if (pe.looks_packed) conf += 6;
+        if (trusted_img)   conf -= 18;
+        conf = conf_clamp(conf);
+
+        if (conf >= 55) {
+            bus_emit(c->bus, "SPY.CRED_API", SEV_HIGH, conf, ACT_REVIEW,
+                     pr->pid, target,
+                     "Process imports Windows credential/secret APIs with risk signals",
+                     "pid %lu (%s) imports Cred/Vault/DPAPI APIs with %s%s%s%s; "
+                     "sign=%s; image=%s",
+                     (unsigned long)pr->pid, name,
+                     pe.imp_net_api ? "net " : "",
+                     pe.imp_crypt_api ? "crypt " : "",
+                     user_writable ? "user-writable-path " : "",
+                     unsigned_img ? "unsigned/invalid-signature" : "",
+                     sign_name((SignVerdict)sstate), img);
+        }
     }
 }
 
@@ -337,14 +539,22 @@ static void detect_injected_dlls(ScanCtx *c)
         PeInfo pe;
         if (!pe_analyze(t->path, &pe))
             continue;
-        bool hooklike = pe.imp_hook_api || pe.imp_keystate_api ||
-                        pe.imp_rawinput_api;
-        if (!hooklike)
+        bool keyboardlike = pe_keyboard_capture(&pe);
+        bool capturelike = keyboardlike || pe.imp_clipboard_api ||
+                           pe.imp_screen_api || pe.imp_media_capture_api;
+        if (!capturelike)
             continue;
 
         SignVerdict sv = sign_verify(t->path, NULL, 0);
         if (sv == SIGN_SIGNED_MS)
             continue;       /* MS-signed shared DLL: legit fan-out (e.g. shims) */
+        if (sv == SIGN_SIGNED && !pe.imp_net_api && !pe.imp_crypt_api) {
+            bool strong_capture = pe.imp_keystate_api || pe.imp_rawinput_api ||
+                                  pe.imp_clipboard_api ||
+                                  pe.imp_media_capture_api;
+            if (!strong_capture)
+                continue;   /* signed GUI/render DLL fan-out is common */
+        }
 
         char base[SC_NAME_LEN];
         base_name(t->path, base, sizeof(base));
@@ -352,17 +562,24 @@ static void detect_injected_dlls(ScanCtx *c)
         int conf = 72;
         if (sv == SIGN_UNSIGNED || sv == SIGN_INVALID) conf += 15;
         if (pe.imp_net_api) conf += 5;
+        if (pe.imp_clipboard_api || pe.imp_screen_api ||
+            pe.imp_media_capture_api) conf += 6;
         if (t->count >= DLL_FANOUT_MIN * 3) conf += 5;
         if (conf > 97) conf = 97;
 
-        bus_emit(c->bus, "KEY.INJECTED_DLL", SEV_HIGH, conf, ACT_REVIEW,
+        char caps[160];
+        capture_tags(&pe, caps, sizeof(caps));
+        const char *rule = keyboardlike ? "KEY.INJECTED_DLL"
+                                        : "SPY.INJECTED_CAPTURE_DLL";
+        const char *title = keyboardlike
+            ? "Non-system hook/keystate DLL injected across many processes"
+            : "Non-system capture-capable DLL injected across many processes";
+
+        bus_emit(c->bus, rule, SEV_HIGH, conf, ACT_REVIEW,
                  0, t->path,
-                 "Non-system hook/keystate DLL injected across many processes",
-                 "%s loaded into %d processes; imports %s%s%s; sign=%s; path=%s",
-                 base, t->count,
-                 pe.imp_hook_api ? "hook " : "",
-                 pe.imp_keystate_api ? "keystate " : "",
-                 pe.imp_rawinput_api ? "rawinput " : "",
+                 title,
+                 "%s loaded into %d processes; imports [%s]; sign=%s; path=%s",
+                 base, t->count, caps,
                  sign_name(sv), t->path);
     }
 
