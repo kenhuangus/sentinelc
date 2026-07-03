@@ -18,27 +18,21 @@ SentinelC is an on-demand, transparent Windows triage and response tool:
   remote upload helpers.
 - Endpoint installer that runs scheduled scans as SYSTEM after one install-time
   elevation.
+- Canonical segment-aware path classification and action-aware scheduled-task
+  parsing for Exec and ComHandler actions.
 - Codex skill/plugin packaging for guided incident-response workflows.
 
 ## What Still Belongs In v2
 
-1. **Path canonicalization cleanup.**
-   Replace remaining substring-style path classification with canonical,
-   segment-aware Windows path checks.
-
-2. **Real XML parsing for scheduled tasks.**
-   Move task parsing to MSXML/COM or a robust parser so comments, CDATA,
-   namespaces, attributes, and `ComHandler` actions are handled consistently.
-
-3. **Persistent caches and performance engineering.**
+1. **Persistent caches and performance engineering.**
    Persist signature results across runs, cache PE analysis by file identity, and
    parallelize FIM hashing without weakening integrity semantics.
 
-4. **YARA maturity.**
+2. **YARA maturity.**
    Either embed libyara or publish a documented supported subset for
    `yara_lite.c` with tests.
 
-5. **Signed kernel driver.**
+3. **Signed kernel driver.**
    A driver is still the only honest route to kernel-vantage rootkit visibility
    and real-time blocking. It requires WDK/MSVC, EV/attestation signing, a driver
    update model, and a much larger testing burden.
@@ -85,9 +79,8 @@ workflow help.
 
 ## Suggested Next Sequence
 
-1. Finish path canonicalization and scheduled-task XML parsing.
-2. Add persistent signature/PE caches and profile the full scan again.
-3. Package signed releases and installer builds.
-4. Harden Fleet Console deployment: TLS reverse-proxy recipes, host token
+1. Add persistent signature/PE caches and profile the full scan again.
+2. Package signed releases and installer builds.
+3. Harden Fleet Console deployment: TLS reverse-proxy recipes, host token
    rotation, and enrollment docs.
-5. Treat kernel-driver work as a funded milestone, not a sprint.
+4. Treat kernel-driver work as a funded milestone, not a sprint.

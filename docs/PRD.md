@@ -90,9 +90,10 @@ replacement.
 ### FR-6 Persistence And Tamper
 
 - Inspect Run/RunOnce, Winlogon, AppInit, AppCertDLLs, IFEO,
-  SilentProcessExit, startup folders, scheduled tasks, WMI subscriptions, COM
-  hijacks, service registry view, Defender/security-service tamper, proxy
-  settings, browser extensions, and App Paths.
+  SilentProcessExit, startup folders, scheduled task Exec and ComHandler
+  actions, WMI subscriptions, COM hijacks, service registry view,
+  Defender/security-service tamper, proxy settings, browser extensions, and App
+  Paths.
 
 ### FR-7 Targeted File Scan
 
@@ -159,8 +160,6 @@ replacement.
 
 ## Future Work
 
-- Canonical path classification cleanup.
-- Robust scheduled-task XML parsing.
 - Persistent signature/PE caches.
 - Parallel FIM hashing.
 - Full YARA/libyara or a larger documented subset.

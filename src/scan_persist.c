@@ -1024,90 +1024,326 @@ static void xml_sanitize(const char *xml, char *out, size_t cap)
     out[o] = '\0';
 }
 
-/* Pull the text of the first <tag ...> ... </tag> from an already-sanitized
- * UTF-8 XML buffer. Tolerates:
- *   - attributes on the open tag:   <Command xml:space="preserve">
- *   - an optional namespace prefix: <ns:Command>
- *   - whitespace around the value (trimmed)
- * Returns true if found (non-empty trimmed value written to out). Bounded and
- * safe on malformed/truncated input. */
-static bool xml_find_open(const char *xml, const char *tag, const char **body)
+static int xml_hexval(char ch)
 {
-    size_t tlen = strlen(tag);
-    const char *p = xml;
-    while ((p = strchr(p, '<')) != NULL) {
-        const char *q = p + 1;
-        /* optional namespace prefix: skip "<prefix:" */
-        const char *name = q;
-        const char *colon = NULL;
-        for (const char *r = q; *r && *r != '>' && *r != ' ' &&
-                                 *r != '\t' && *r != '\r' && *r != '\n'; r++) {
-            if (*r == ':') colon = r;
-        }
-        if (colon) name = colon + 1;
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return 10 + (ch - 'a');
+    if (ch >= 'A' && ch <= 'F') return 10 + (ch - 'A');
+    return -1;
+}
 
-        if (strncmp(name, tag, tlen) == 0) {
-            char after = name[tlen];
-            /* the char after the tag name must end the name: '>' closes the
-             * tag, whitespace introduces attributes, '/' is a self-close. */
-            if (after == '>' || after == ' ' || after == '\t' ||
-                after == '\r' || after == '\n' || after == '/') {
-                /* scan to the closing '>' of this open tag */
-                const char *gt = strchr(name + tlen, '>');
-                if (!gt) return false;          /* truncated open tag */
-                if (gt[-1] == '/') {            /* <Command/> -- empty */
-                    p = gt + 1;
+static void xml_unescape_inplace(char *s)
+{
+    char *r = s;
+    char *w = s;
+    while (*r) {
+        if (*r == '&') {
+            if (strncmp(r, "&amp;", 5) == 0)   { *w++ = '&';  r += 5; continue; }
+            if (strncmp(r, "&lt;", 4) == 0)    { *w++ = '<';  r += 4; continue; }
+            if (strncmp(r, "&gt;", 4) == 0)    { *w++ = '>';  r += 4; continue; }
+            if (strncmp(r, "&quot;", 6) == 0)  { *w++ = '"';  r += 6; continue; }
+            if (strncmp(r, "&apos;", 6) == 0)  { *w++ = '\''; r += 6; continue; }
+            if (r[1] == '#') {
+                const char *p = r + 2;
+                bool hex = false;
+                unsigned long val = 0;
+                int digits = 0;
+                if (*p == 'x' || *p == 'X') { hex = true; p++; }
+                while (*p && *p != ';') {
+                    int d = hex ? xml_hexval(*p) :
+                                  ((*p >= '0' && *p <= '9') ? *p - '0' : -1);
+                    if (d < 0) break;
+                    val = hex ? (val * 16u + (unsigned)d)
+                              : (val * 10u + (unsigned)d);
+                    digits++;
+                    p++;
+                }
+                if (*p == ';' && digits > 0 && val > 0 && val < 0x80) {
+                    *w++ = (char)val;
+                    r = (char *)(p + 1);
                     continue;
                 }
-                *body = gt + 1;
-                return true;
             }
         }
-        p = q;
+        *w++ = *r++;
+    }
+    *w = '\0';
+}
+
+static bool xml_is_name_end(char ch)
+{
+    return ch == '>' || ch == '/' || ch == ' ' || ch == '\t' ||
+           ch == '\r' || ch == '\n';
+}
+
+static bool xml_open_is_self_closing(const char *lt, const char *gt)
+{
+    const char *p = gt;
+    while (p > lt) {
+        p--;
+        if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+            continue;
+        return *p == '/';
     }
     return false;
 }
 
-static bool xml_extract(const char *xml, const char *tag,
-                        char *out, size_t cap)
+static bool xml_tag_matches_at(const char *name, const char *limit,
+                               const char *tag, size_t tlen)
 {
-    /* Sanitize first (drop comments, unwrap CDATA) so hidden/forged tags
-     * can't fool the scan and real CDATA payloads are recovered. Heap to
-     * keep the stack frame small (called per task file). */
-    char *clean = (char *)malloc(1 << 16);
-    if (!clean) return false;
-    xml_sanitize(xml, clean, 1 << 16);
-
-    const char *s = NULL;
-    if (!xml_find_open(clean, tag, &s)) { free(clean); return false; }
-
-    /* End: the matching close tag, allowing a namespace prefix.
-     * Search for "</...tag>" -- accept "</tag>" or "</ns:tag>". */
-    const char *e = NULL;
-    const char *scan = s;
-    size_t tlen = strlen(tag);
-    while ((scan = strstr(scan, "</")) != NULL) {
-        const char *n = scan + 2;
-        const char *colon = NULL;
-        for (const char *r = n; *r && *r != '>'; r++)
-            if (*r == ':') colon = r;
-        const char *nm = colon ? colon + 1 : n;
-        if (strncmp(nm, tag, tlen) == 0 &&
-            (nm[tlen] == '>' || nm[tlen] == ' ' || nm[tlen] == '\t')) {
-            e = scan;
-            break;
-        }
-        scan += 2;
+    const char *colon = NULL;
+    for (const char *r = name; r < limit && *r && !xml_is_name_end(*r); r++) {
+        if (*r == ':') colon = r;
     }
-    if (!e) { free(clean); return false; }
+    const char *nm = colon ? colon + 1 : name;
+    if ((size_t)(limit - nm) < tlen)
+        return false;
+    return strncmp(nm, tag, tlen) == 0 && xml_is_name_end(nm[tlen]);
+}
 
+static bool xml_find_open_limited(const char *start, const char *limit,
+                                  const char *tag, const char **body,
+                                  const char **after_open, bool *self_closing)
+{
+    size_t tlen = strlen(tag);
+    const char *p = start;
+    if (!limit) limit = start + strlen(start);
+
+    while (p && p < limit) {
+        p = strchr(p, '<');
+        if (!p || p >= limit) break;
+        const char *q = p + 1;
+        if (q >= limit) break;
+        if (*q == '/' || *q == '?' || *q == '!') {
+            p = q + 1;
+            continue;
+        }
+        if (xml_tag_matches_at(q, limit, tag, tlen)) {
+            const char *gt = strchr(q, '>');
+            if (!gt || gt >= limit)
+                return false;
+            bool closed = xml_open_is_self_closing(p, gt);
+            if (body) *body = closed ? gt : gt + 1;
+            if (after_open) *after_open = gt + 1;
+            if (self_closing) *self_closing = closed;
+            return true;
+        }
+        p = q + 1;
+    }
+    return false;
+}
+
+static const char *xml_find_close_limited(const char *start, const char *limit,
+                                          const char *tag)
+{
+    size_t tlen = strlen(tag);
+    const char *p = start;
+    if (!limit) limit = start + strlen(start);
+
+    while (p && p < limit) {
+        p = strstr(p, "</");
+        if (!p || p >= limit) break;
+        const char *name = p + 2;
+        if (name >= limit) break;
+        if (xml_tag_matches_at(name, limit, tag, tlen))
+            return p;
+        p = name + 1;
+    }
+    return NULL;
+}
+
+static bool xml_find_element_limited(const char *start, const char *limit,
+                                     const char *tag, const char **body,
+                                     const char **end, const char **next)
+{
+    const char *b = NULL, *after_open = NULL;
+    bool self = false;
+    if (!limit) limit = start + strlen(start);
+    if (!xml_find_open_limited(start, limit, tag, &b, &after_open, &self))
+        return false;
+    if (self) {
+        if (body) *body = b;
+        if (end) *end = b;
+        if (next) *next = after_open;
+        return true;
+    }
+    const char *e = xml_find_close_limited(b, limit, tag);
+    if (!e)
+        return false;
+    const char *gt = strchr(e, '>');
+    if (!gt || gt >= limit) gt = limit - 1;
+    if (body) *body = b;
+    if (end) *end = e;
+    if (next) *next = gt + 1;
+    return true;
+}
+
+static bool xml_extract_limited(const char *start, const char *limit,
+                                const char *tag, char *out, size_t cap)
+{
+    const char *s = NULL, *e = NULL, *next = NULL;
+    if (cap == 0) return false;
+    out[0] = '\0';
+    if (!xml_find_element_limited(start, limit, tag, &s, &e, &next))
+        return false;
     size_t len = (size_t)(e - s);
     if (len >= cap) len = cap - 1;
     memcpy(out, s, len);
     out[len] = '\0';
+    xml_unescape_inplace(out);
     trim_ws(out);
-    free(clean);
     return out[0] != '\0';
+}
+
+static void emit_task_exec(ScanCtx *c, const char *rel,
+                           const char *command, const char *args,
+                           bool have_arg)
+{
+    char target[SC_MAX_PATH];
+    extract_target(command, target, sizeof target);
+    if (target[0] == '\0') {
+        strncpy(target, command, sizeof target - 1);
+        target[sizeof target - 1] = '\0';
+    }
+    if (allowlist_match(target) || allowlist_match(rel)) return;
+
+    /* Severity bump conditions:
+     *  - command resolves into a user-writable path, OR
+     *  - command is powershell/mshta with encoded/obfuscated args. */
+    bool risky = false;
+    char reason[160]; reason[0] = '\0';
+
+    if (path_is_user_writable(target)) {
+        risky = true;
+        snprintf(reason, sizeof reason, "user-writable target");
+    }
+
+    char tlow[SC_MAX_PATH];
+    strncpy(tlow, target, sizeof tlow - 1); tlow[sizeof tlow - 1] = '\0';
+    str_lower(tlow);
+    bool is_ps    = strstr(tlow, "powershell") != NULL ||
+                    strstr(tlow, "pwsh")       != NULL;
+    bool is_mshta = strstr(tlow, "mshta")      != NULL;
+    if ((is_ps || is_mshta) && have_arg) {
+        char alow[SC_MAX_CMDLINE];
+        strncpy(alow, args, sizeof alow - 1); alow[sizeof alow - 1] = '\0';
+        str_lower(alow);
+        if (strstr(alow, "-enc") || strstr(alow, "encodedcommand") ||
+            strstr(alow, "-e ")  || strstr(alow, "frombase64") ||
+            strstr(alow, "frombase64string") ||
+            strstr(alow, "invoke-expression") ||
+            strstr(alow, "iex")  || strstr(alow, "downloadstring") ||
+            strstr(alow, "javascript:") || strstr(alow, "vbscript:")) {
+            risky = true;
+            if (reason[0])
+                snprintf(reason + strlen(reason),
+                         sizeof reason - strlen(reason),
+                         ", encoded %s", is_ps ? "powershell" : "mshta");
+            else
+                snprintf(reason, sizeof reason, "encoded %s",
+                         is_ps ? "powershell" : "mshta");
+        }
+    }
+
+    bus_emit(c->bus, "PERSIST.TASK",
+             risky ? SEV_MED : SEV_LOW,
+             risky ? 65 : 40,
+             ACT_REVIEW, 0, target,
+             "Scheduled task autostart",
+             "Task %s: Command=\"%s\"%s%s%s%s", rel, command,
+             have_arg ? " Arguments=\"" : "",
+             have_arg ? args : "",
+             have_arg ? "\"" : "",
+             reason[0] ? reason : "");
+}
+
+static bool read_com_server(HKEY root, const char *clsid,
+                            char *server, size_t scp,
+                            char *where, size_t wcap)
+{
+    static const char *leaves[] = { "InprocServer32", "LocalServer32", NULL };
+    static const char *bases[] = {
+        "Software\\Classes\\CLSID\\%s\\%s",
+        "Software\\Classes\\Wow6432Node\\CLSID\\%s\\%s",
+        NULL
+    };
+
+    for (int b = 0; bases[b]; b++) {
+        for (int l = 0; leaves[l]; l++) {
+            char sub[SC_MAX_PATH];
+            snprintf(sub, sizeof sub, bases[b], clsid, leaves[l]);
+            if (read_reg_sz(root, sub, NULL, server, scp) && server[0]) {
+                snprintf(where, wcap, "%s\\%s", root_label(root), sub);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void emit_task_comhandler(ScanCtx *c, const char *rel,
+                                 const char *clsid, const char *data)
+{
+    if (!clsid || clsid[0] == '\0') return;
+    if (allowlist_match(clsid) || allowlist_match(rel)) return;
+
+    char server[SC_MAX_CMDLINE] = "";
+    char regwhere[SC_MAX_PATH] = "";
+    HKEY server_root = NULL;
+    if (read_com_server(HKEY_CURRENT_USER, clsid, server, sizeof server,
+                        regwhere, sizeof regwhere)) {
+        server_root = HKEY_CURRENT_USER;
+    } else if (read_com_server(HKEY_LOCAL_MACHINE, clsid, server, sizeof server,
+                               regwhere, sizeof regwhere)) {
+        server_root = HKEY_LOCAL_MACHINE;
+    }
+
+    char target[SC_MAX_PATH];
+    target[0] = '\0';
+    if (server[0])
+        extract_target(server, target, sizeof target);
+    if (target[0] == '\0') {
+        strncpy(target, clsid, sizeof target - 1);
+        target[sizeof target - 1] = '\0';
+    }
+    if (allowlist_match(target)) return;
+
+    char reason[160];
+    reason[0] = '\0';
+    bool risky = false;
+    if (server_root == HKEY_CURRENT_USER) {
+        risky = true;
+        snprintf(reason, sizeof reason, "per-user COM registration");
+    }
+    if (server[0]) {
+        char why[128];
+        if (target_is_risky(target, why, sizeof why, NULL) && why[0]) {
+            risky = true;
+            if (reason[0])
+                snprintf(reason + strlen(reason),
+                         sizeof reason - strlen(reason),
+                         ", %s", why);
+            else
+                snprintf(reason, sizeof reason, "%s", why);
+        }
+    }
+
+    bus_emit(c->bus, "PERSIST.TASK_COMHANDLER",
+             risky ? SEV_MED : SEV_LOW,
+             risky ? 70 : 45,
+             ACT_REVIEW, 0, target,
+             "Scheduled task COM handler autostart",
+             "Task %s: ComHandler ClassId=\"%s\"%s%s%s%s%s%s%s%s%s",
+             rel, clsid,
+             server[0] ? " Server=\"" : "",
+             server[0] ? server : "",
+             server[0] ? "\"" : "",
+             data && data[0] ? " Data=\"" : "",
+             data && data[0] ? data : "",
+             data && data[0] ? "\"" : "",
+             reason[0] ? " [" : "",
+             reason[0] ? reason : "",
+             reason[0] ? "]" : "");
 }
 
 static void scan_task_file(ScanCtx *c, const wchar_t *fullw,
@@ -1155,67 +1391,66 @@ static void scan_task_file(ScanCtx *c, const wchar_t *fullw,
             xml = raw + 3;
     }
 
-    char command[SC_MAX_PATH];
-    char args[SC_MAX_CMDLINE];
-    bool have_cmd = xml_extract(xml, "Command", command, sizeof command);
-    bool have_arg = xml_extract(xml, "Arguments", args, sizeof args);
+    char *clean = (char *)malloc(1 << 16);
+    if (!clean) { free(raw); return; }
+    xml_sanitize(xml, clean, 1 << 16);
     free(raw);
 
-    if (!have_cmd) return;     /* nothing actionable to resolve */
+    int emitted_exec = 0;
+    const char *cursor = clean;
+    for (int guard = 0; guard < 128; guard++) {
+        const char *body = NULL, *end = NULL, *next = NULL;
+        if (!xml_find_element_limited(cursor, NULL, "Exec", &body, &end, &next))
+            break;
 
-    char target[SC_MAX_PATH];
-    extract_target(command, target, sizeof target);
-    if (target[0] == '\0') {
-        strncpy(target, command, sizeof target - 1);
-        target[sizeof target - 1] = '\0';
-    }
-    if (allowlist_match(target) || allowlist_match(rel)) return;
-
-    /* Severity bump conditions:
-     *  - command resolves into a user-writable path, OR
-     *  - command is powershell/mshta with encoded/obfuscated args. */
-    bool risky = false;
-    char reason[160]; reason[0] = '\0';
-
-    if (path_is_user_writable(target)) {
-        risky = true;
-        snprintf(reason, sizeof reason, "user-writable target");
-    }
-
-    char tlow[SC_MAX_PATH];
-    strncpy(tlow, target, sizeof tlow - 1); tlow[sizeof tlow - 1] = '\0';
-    str_lower(tlow);
-    bool is_ps   = strstr(tlow, "powershell") != NULL;
-    bool is_mshta= strstr(tlow, "mshta")      != NULL;
-    if ((is_ps || is_mshta) && have_arg) {
-        char alow[SC_MAX_CMDLINE];
-        strncpy(alow, args, sizeof alow - 1); alow[sizeof alow - 1] = '\0';
-        str_lower(alow);
-        if (strstr(alow, "-enc") || strstr(alow, "encodedcommand") ||
-            strstr(alow, "-e ")  || strstr(alow, "frombase64") ||
-            strstr(alow, "iex")  || strstr(alow, "downloadstring") ||
-            strstr(alow, "javascript:") || strstr(alow, "vbscript:")) {
-            risky = true;
-            if (reason[0])
-                snprintf(reason + strlen(reason),
-                         sizeof reason - strlen(reason),
-                         ", encoded %s", is_ps ? "powershell" : "mshta");
-            else
-                snprintf(reason, sizeof reason, "encoded %s",
-                         is_ps ? "powershell" : "mshta");
+        char command[SC_MAX_PATH];
+        char args[SC_MAX_CMDLINE];
+        bool have_cmd = xml_extract_limited(body, end, "Command",
+                                            command, sizeof command);
+        bool have_arg = xml_extract_limited(body, end, "Arguments",
+                                            args, sizeof args);
+        if (have_cmd) {
+            emit_task_exec(c, rel, command, args, have_arg);
+            emitted_exec++;
         }
+        if (!next || next <= cursor)
+            break;
+        cursor = next;
     }
 
-    bus_emit(c->bus, "PERSIST.TASK",
-             risky ? SEV_MED : SEV_LOW,
-             risky ? 65 : 40,
-             ACT_REVIEW, 0, target,
-             "Scheduled task autostart",
-             "Task %s: Command=\"%s\"%s%s%s%s", rel, command,
-             have_arg ? " Arguments=\"" : "",
-             have_arg ? args : "",
-             have_arg ? "\"" : "",
-             reason[0] ? reason : "");
+    /* Compatibility fallback for unusual task XML that has Command directly
+     * under Actions instead of an Exec wrapper. */
+    if (emitted_exec == 0) {
+        char command[SC_MAX_PATH];
+        char args[SC_MAX_CMDLINE];
+        bool have_cmd = xml_extract_limited(clean, NULL, "Command",
+                                            command, sizeof command);
+        bool have_arg = xml_extract_limited(clean, NULL, "Arguments",
+                                            args, sizeof args);
+        if (have_cmd)
+            emit_task_exec(c, rel, command, args, have_arg);
+    }
+
+    cursor = clean;
+    for (int guard = 0; guard < 128; guard++) {
+        const char *body = NULL, *end = NULL, *next = NULL;
+        if (!xml_find_element_limited(cursor, NULL, "ComHandler",
+                                      &body, &end, &next))
+            break;
+        char clsid[SC_NAME_LEN];
+        char data[SC_MAX_CMDLINE];
+        bool have_clsid = xml_extract_limited(body, end, "ClassId",
+                                              clsid, sizeof clsid);
+        bool have_data = xml_extract_limited(body, end, "Data",
+                                             data, sizeof data);
+        if (have_clsid)
+            emit_task_comhandler(c, rel, clsid, have_data ? data : "");
+        if (!next || next <= cursor)
+            break;
+        cursor = next;
+    }
+
+    free(clean);
 }
 
 static void walk_tasks(ScanCtx *c, const wchar_t *dirw, const char *relbase,

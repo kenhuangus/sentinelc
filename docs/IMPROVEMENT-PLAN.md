@@ -34,43 +34,40 @@ the remaining plan does not describe stale work.
   `CRED.LSASS_HANDLE`, `CRED.SENSITIVE_FILE`, `MEM.SHELLCODE`,
   `MEM.REFLECTIVE_PE`, `PROC.HOLLOWED`, `EVADE.AMSI_PATCH`,
   `EVADE.ETW_PATCH`, `PERSIST.APPCERT`, `PERSIST.LSA_PROVIDER`,
-  `PERSIST.SILENT_EXIT`, and `PERSIST.SVC_REGISTRY`.
+  `PERSIST.SILENT_EXIT`, `PERSIST.SVC_REGISTRY`, and
+  `PERSIST.TASK_COMHANDLER`.
+- `heur.c` path classification canonicalizes Windows paths, lowercases them,
+  expands short names when possible, and uses segment-boundary checks instead
+  of substring classification.
+- `scan_persist.c` scheduled-task parsing sanitizes comments/CDATA, understands
+  namespaces/attributes, scans each Exec action independently, decodes common
+  XML entities, and emits ComHandler actions.
 
 ## Remaining Highest-Value Work
 
-1. **Path canonicalization across heuristics.**
-   Replace substring path classification in `heur.c` with canonical
-   `GetFullPathNameW`/`GetLongPathNameW` plus segment-boundary checks. This
-   strengthens every path-gated process, service, persistence, and file rule.
-
-2. **Robust scheduled-task XML parsing.**
-   `scan_persist.c` handles multiple task shapes, but a real XML reader would be
-   safer than string parsing for comments, CDATA, namespaces, attributes, and
-   `ComHandler` actions.
-
-3. **Persistent signature cache.**
+1. **Persistent signature cache.**
    The in-process signature cache exists, but cold scans still reverify every
    file. Add `%ProgramData%\SentinelC\sign_cache.tsv` keyed by path, size, and
    mtime.
 
-4. **PE analysis cache.**
+2. **PE analysis cache.**
    Cache `pe_analyze` by path, size, and mtime and stash `PeInfo` on `ProcRec`
    so process, keylogger, service, file, and correlation paths do not repeat the
    same PE parse work.
 
-5. **Parallel FIM hashing.**
+3. **Parallel FIM hashing.**
    `scan_integrity.c` correctly streams every tracked file now. Add a producer
    plus worker pool after making `list_add` thread-safe.
 
-6. **Full YARA engine or larger supported subset.**
+4. **Full YARA engine or larger supported subset.**
    The current `yara_lite.c` is useful but not libyara. Decide whether to embed
    libyara or clearly define the supported subset and add tests for it.
 
-7. **Code signing and release hardening.**
+5. **Code signing and release hardening.**
    Production distribution needs a signed binary and installer so SmartScreen
    and AV reputation do not dominate first-run trust.
 
-8. **Kernel-driver design remains future work.**
+6. **Kernel-driver design remains future work.**
    A signed driver is still the only honest way to get kernel-vantage rootkit
    visibility and blocking. It requires WDK/MSVC, signing, and a different
    release process.

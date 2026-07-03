@@ -59,9 +59,10 @@ the reporter handle presentation.
 - `scan_service.c`: service and driver inventory, service binary normalization,
   signature/path checks, unquoted paths, and suspicious `svchost` service DLLs.
 - `scan_persist.c`: Run keys, Winlogon, AppInit, AppCertDLLs, IFEO,
-  SilentProcessExit, startup folders, scheduled tasks, WMI subscriptions, COM
-  hijacks, service registry view, Defender/security-service tamper, proxy
-  settings, browser extensions, and App Paths.
+  SilentProcessExit, startup folders, scheduled task Exec and ComHandler
+  actions, WMI subscriptions, COM hijacks, service registry view,
+  Defender/security-service tamper, proxy settings, browser extensions, and App
+  Paths.
 - `scan_network.c`: TCP/UDP endpoints, suspicious listeners, shell-socket shape,
   raw-IP outbound connections, IOC IP matches, and optional beacon sampling.
 - `scan_keylog.c`: low-level hooks, raw input, key-state polling, clipboard,
