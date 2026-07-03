@@ -48,6 +48,8 @@ the remaining plan does not describe stale work.
   does not suppress a changed file.
 - `pe.c` memoizes `pe_analyze` results in-process by path, size, and mtime,
   avoiding repeated PE mapping and import parsing within one scan.
+- JSON reports include cache hit/miss counters for signature and PE analysis
+  caches, which gives the performance work a stable measurement surface.
 
 ## Remaining Highest-Value Work
 

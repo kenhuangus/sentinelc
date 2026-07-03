@@ -49,6 +49,18 @@ static INIT_ONCE        g_cache_once = INIT_ONCE_STATIC_INIT;
 static bool             g_cache_ready = false;
 static bool             g_persist_ready = false;
 static char             g_persist_path[SC_MAX_PATH];
+static volatile LONG64  g_sign_calls = 0;
+static volatile LONG64  g_sign_memory_hits = 0;
+static volatile LONG64  g_sign_persistent_hits = 0;
+static volatile LONG64  g_sign_verifications = 0;
+static volatile LONG64  g_sign_persistent_hash_checks = 0;
+static volatile LONG64  g_sign_persistent_loaded = 0;
+static volatile LONG64  g_sign_persistent_saved = 0;
+
+static uint64_t atomic_read64(volatile LONG64 *p)
+{
+    return (uint64_t)InterlockedCompareExchange64(p, 0, 0);
+}
 
 static uint64_t ft_to_u64(const FILETIME *ft)
 {
@@ -490,6 +502,7 @@ static void persistent_cache_load(void)
         u64_to_ft((uint64_t)mtime64, &ft);
         cache_put_ex(path, &ft, (uint64_t)fsize, sha, (SignVerdict)v,
                      signer, true);
+        InterlockedIncrement64(&g_sign_persistent_loaded);
     }
 
     fclose(f);
@@ -535,6 +548,7 @@ static void persistent_cache_save(void)
                 (int)e->verdict,
                 signer,
                 path);
+        InterlockedIncrement64(&g_sign_persistent_saved);
     }
     LeaveCriticalSection(&g_cache_lock);
 
@@ -550,6 +564,29 @@ static void persistent_cache_save(void)
         return;
     }
     apply_admin_system_dacl(g_persist_path);
+}
+
+void sign_cache_stats(SignCacheStats *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    out->calls = atomic_read64(&g_sign_calls);
+    out->memory_hits = atomic_read64(&g_sign_memory_hits);
+    out->persistent_hits = atomic_read64(&g_sign_persistent_hits);
+    out->verifications = atomic_read64(&g_sign_verifications);
+    out->persistent_hash_checks =
+        atomic_read64(&g_sign_persistent_hash_checks);
+    out->persistent_entries_loaded =
+        atomic_read64(&g_sign_persistent_loaded);
+    out->persistent_entries_saved =
+        atomic_read64(&g_sign_persistent_saved);
+    out->persistent_enabled = g_persist_ready;
+
+    if (g_cache_ready) {
+        EnterCriticalSection(&g_cache_lock);
+        out->entries = (uint64_t)g_cache_count;
+        LeaveCriticalSection(&g_cache_lock);
+    }
 }
 
 /* --------------------------------------------------------------- signer name */
@@ -763,6 +800,7 @@ SignVerdict sign_verify(const char *path, char *signer_out, size_t signer_cap)
 {
     if (signer_out && signer_cap > 0) signer_out[0] = '\0';
     if (!path || path[0] == '\0') return SIGN_UNKNOWN;
+    InterlockedIncrement64(&g_sign_calls);
     if (!g_cache_ready) sign_cache_init();   /* tolerate missing init */
 
     wchar_t wpath[SC_MAX_PATH * 2];
@@ -788,19 +826,26 @@ SignVerdict sign_verify(const char *path, char *signer_out, size_t signer_cap)
     str_lower(lpath);
 
     SignVerdict cached;
-    if (cache_get_fast(lpath, &mtime, fsize, &cached, signer_out, signer_cap))
+    if (cache_get_fast(lpath, &mtime, fsize, &cached, signer_out, signer_cap)) {
+        InterlockedIncrement64(&g_sign_memory_hits);
         return cached;
+    }
 
     char sha256[65] = "";
     if (have_meta && g_persist_ready &&
         cache_has_persistent_candidate(lpath, &mtime, fsize) &&
-        sha256_file_hex_w(wpath, fsize, sha256) &&
-        cache_get_persistent(lpath, &mtime, fsize, sha256, &cached,
-                             signer_out, signer_cap))
-        return cached;
+        sha256_file_hex_w(wpath, fsize, sha256)) {
+        InterlockedIncrement64(&g_sign_persistent_hash_checks);
+        if (cache_get_persistent(lpath, &mtime, fsize, sha256, &cached,
+                                 signer_out, signer_cap)) {
+            InterlockedIncrement64(&g_sign_persistent_hits);
+            return cached;
+        }
+    }
 
     char signer[SC_NAME_LEN] = {0};
     SignVerdict verdict;
+    InterlockedIncrement64(&g_sign_verifications);
 
     LONG status = verify_embedded(wpath);
     if (status == ERROR_SUCCESS) {

@@ -107,6 +107,8 @@ quarantine. Important safety properties:
 - `pe.c` keeps an in-process `pe_analyze` result cache by lowercased path, file
   size, and last-write time so process, keylogger, service, file, and
   correlation paths do not repeatedly map and parse the same image in one scan.
+- JSON reports include a `cache` object with signature and PE cache hit/miss
+  counters so performance changes can be compared without parsing debug logs.
 
 ## Fleet Console And Endpoint Agent
 

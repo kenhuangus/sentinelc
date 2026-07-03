@@ -27,8 +27,8 @@ SentinelC is an on-demand, transparent Windows triage and response tool:
 ## What Still Belongs In v2
 
 1. **Performance engineering.**
-   Parallelize FIM hashing and add cache-hit instrumentation without weakening
-   integrity semantics.
+   Parallelize FIM hashing and profile full scans without weakening integrity
+   semantics.
 
 2. **YARA maturity.**
    Either embed libyara or publish a documented supported subset for
@@ -81,7 +81,7 @@ workflow help.
 
 ## Suggested Next Sequence
 
-1. Profile the full scan and add cache-hit instrumentation.
+1. Profile the full scan and parallelize FIM hashing.
 2. Package signed releases and installer builds.
 3. Harden Fleet Console deployment: TLS reverse-proxy recipes, host token
    rotation, and enrollment docs.

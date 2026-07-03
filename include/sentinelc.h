@@ -215,6 +215,17 @@ typedef struct {
 /* Analyze a file on disk. Returns false if not a readable PE. */
 bool pe_analyze(const char *path, PeInfo *out);
 
+typedef struct {
+    uint64_t calls;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t stores;
+    uint64_t entries;
+    bool enabled;
+} PeCacheStats;
+
+void pe_cache_stats(PeCacheStats *out);
+
 /* Shannon entropy of a buffer, 0..8. (heur.c) */
 double shannon_entropy(const unsigned char *buf, size_t len);
 
@@ -237,6 +248,20 @@ const char *sign_name(SignVerdict v);            /* util.c */
 SignVerdict sign_verify(const char *path, char *signer_out, size_t signer_cap);
 void        sign_cache_init(void);
 void        sign_cache_free(void);
+
+typedef struct {
+    uint64_t calls;
+    uint64_t memory_hits;
+    uint64_t persistent_hits;
+    uint64_t verifications;
+    uint64_t persistent_hash_checks;
+    uint64_t persistent_entries_loaded;
+    uint64_t persistent_entries_saved;
+    uint64_t entries;
+    bool persistent_enabled;
+} SignCacheStats;
+
+void        sign_cache_stats(SignCacheStats *out);
 
 /* =====================================================================
  *  Heuristics / path classification / allowlist (heur.c)
