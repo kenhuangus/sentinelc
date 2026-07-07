@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "SentinelC Security Tools",
     "shortDescription": "Run SentinelC triage and cleanup safely.",
-    "longDescription": "SentinelC Security Tools bundles a Codex skill for evidence-preserving Windows malware triage, offline-like scans, Defender exclusion review, safe cleanup, quarantine, and verification.",
+    "longDescription": "SentinelC Security Tools bundles a Codex skill for evidence-preserving Windows malware triage, offline-like scans, Codex CLI agent orchestration, Defender exclusion review, safe cleanup, quarantine, and verification.",
     "developerName": "SentinelC Project",
     "category": "Security",
     "capabilities": [
@@ -30,6 +30,7 @@
     "defaultPrompt": [
       "Use SentinelC to run an offline-like scan.",
       "Analyze this SentinelC JSON report.",
+      "Ask Codex CLI to orchestrate an agentic SentinelC security plan.",
       "Create a safe cleanup and verification plan."
     ],
     "brandColor": "#2563EB"
