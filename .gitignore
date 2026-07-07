@@ -11,6 +11,9 @@ __pycache__/
 # Local baselines / system inventories - NEVER commit host-specific paths
 *.tsv
 baseline*
+sentinelc-agent-*/
+sentinelc-scan-*/
+sentinelc-cleanup-*/
 
 # Live IOC lists are incident/host-specific; ship the .example templates instead
 /rules/ioc_ips.txt

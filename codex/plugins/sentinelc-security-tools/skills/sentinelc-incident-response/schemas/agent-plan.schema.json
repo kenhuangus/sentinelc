@@ -1,0 +1,181 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SentinelC Codex Agent Plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "overall_assessment",
+    "risk_score",
+    "executive_summary",
+    "priority_findings",
+    "investigation_plan",
+    "cleanup_plan",
+    "verification_plan",
+    "do_not_touch",
+    "limitations",
+    "provider_notes"
+  ],
+  "properties": {
+    "overall_assessment": {
+      "type": "string",
+      "minLength": 1
+    },
+    "risk_score": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "executive_summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "priority_findings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/priority_finding"
+      }
+    },
+    "investigation_plan": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "cleanup_plan": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/cleanup_item"
+      }
+    },
+    "verification_plan": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "do_not_touch": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "provider_notes": {
+      "type": "string"
+    }
+  },
+  "$defs": {
+    "priority_finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule",
+        "target",
+        "severity",
+        "confidence",
+        "why_it_matters",
+        "evidence",
+        "recommended_next_step",
+        "safe_action",
+        "requires_human_confirmation"
+      ],
+      "properties": {
+        "rule": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target": {
+          "type": "string"
+        },
+        "severity": {
+          "type": "string"
+        },
+        "confidence": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "why_it_matters": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence": {
+          "type": "string"
+        },
+        "recommended_next_step": {
+          "type": "string",
+          "minLength": 1
+        },
+        "safe_action": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requires_human_confirmation": {
+          "type": "boolean"
+        }
+      }
+    },
+    "cleanup_item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action_type",
+        "target",
+        "reason",
+        "preconditions",
+        "rollback",
+        "command_hint",
+        "requires_human_confirmation"
+      ],
+      "properties": {
+        "action_type": {
+          "type": "string",
+          "enum": [
+            "review",
+            "collect_evidence",
+            "remove_defender_exclusion",
+            "disable_persistence",
+            "disable_service",
+            "quarantine_file",
+            "kill_or_suspend_process",
+            "update_ioc",
+            "no_action"
+          ]
+        },
+        "target": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "preconditions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "rollback": {
+          "type": "string",
+          "minLength": 1
+        },
+        "command_hint": {
+          "type": "string"
+        },
+        "requires_human_confirmation": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}
