@@ -7,6 +7,7 @@
     "overall_assessment",
     "risk_score",
     "executive_summary",
+    "orchestration",
     "priority_findings",
     "investigation_plan",
     "cleanup_plan",
@@ -28,6 +29,9 @@
     "executive_summary": {
       "type": "string",
       "minLength": 1
+    },
+    "orchestration": {
+      "$ref": "#/$defs/orchestration"
     },
     "priority_findings": {
       "type": "array",
@@ -74,6 +78,98 @@
     }
   },
   "$defs": {
+    "orchestration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "connected_provider",
+        "current_stage",
+        "next_recommended_tool",
+        "tool_sequence",
+        "stop_conditions"
+      ],
+      "properties": {
+        "role": {
+          "type": "string",
+          "enum": [
+            "codex_cli_orchestrator"
+          ]
+        },
+        "connected_provider": {
+          "type": "string",
+          "minLength": 1
+        },
+        "current_stage": {
+          "type": "string",
+          "enum": [
+            "triage",
+            "investigation",
+            "cleanup_planning",
+            "verification",
+            "monitoring",
+            "blocked"
+          ]
+        },
+        "next_recommended_tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tool_sequence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/orchestration_step"
+          }
+        },
+        "stop_conditions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "orchestration_step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "step",
+        "tool",
+        "purpose",
+        "inputs",
+        "expected_output",
+        "human_gate"
+      ],
+      "properties": {
+        "step": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "purpose": {
+          "type": "string",
+          "minLength": 1
+        },
+        "inputs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "expected_output": {
+          "type": "string",
+          "minLength": 1
+        },
+        "human_gate": {
+          "type": "boolean"
+        }
+      }
+    },
     "priority_finding": {
       "type": "object",
       "additionalProperties": false,

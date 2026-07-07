@@ -1,6 +1,6 @@
 # SentinelC Agentic Codex CLI Provider Spec
 
-Status: corrected after two spec review rounds
+Status: corrected after two spec review rounds and one orchestration clarification
 Requested filename: `agent-sepc.md`
 
 ## 1. Investigation Summary
@@ -14,23 +14,24 @@ SentinelC already has the right local building blocks for an AI-assisted workflo
 - `codex/skills/sentinelc-incident-response/references/destructive-action-policy.md` defines the safety contract for any cleanup.
 - Local Codex CLI version `0.142.4` supports non-interactive `codex exec`, `--cd`, `--sandbox read-only`, `--ask-for-approval never`, `--output-schema`, and `--output-last-message`.
 
-The missing feature is a guarded AI analyst layer. SentinelC should be able to send a compact scan packet to Codex CLI, receive a structured investigation and cleanup plan, and keep all destructive activity outside the model path.
+The missing feature is a guarded AI orchestration layer. SentinelC should be able to send a compact scan packet to Codex CLI, let Codex CLI orchestrate the security-agent workflow, receive a structured investigation and cleanup plan, and keep all destructive activity outside the model path.
 
 ## 2. Goals
 
 1. Add agentic triage behavior for SentinelC reports using Codex CLI as the AI provider.
-2. Keep SentinelC's scanner and responder safety model unchanged.
-3. Produce reviewable artifacts: compact input, prompt, Codex raw result, Markdown plan, and status.
-4. Support both workflows:
+2. When Codex CLI is connected, make Codex CLI the orchestrator for the security-agent workflow.
+3. Keep SentinelC's scanner and responder safety model unchanged.
+4. Produce reviewable artifacts: compact input, prompt, Codex raw result, Markdown plan, and status.
+5. Support both workflows:
    - Analyze an existing SentinelC JSON report.
    - Run SentinelC first, then analyze the new report.
-5. Make the provider call non-interactive and read-only by default.
-6. Keep implementation reusable inside both the standalone Codex skill and the plugin bundle.
+6. Make the provider call non-interactive and read-only by default.
+7. Keep implementation reusable inside both the standalone Codex skill and the plugin bundle.
 
 ## 3. Non-Goals
 
 - Do not embed an AI provider inside the native C scanner.
-- Do not allow Codex to run cleanup commands or mutate the host.
+- Do not allow Codex to run cleanup commands or mutate the host directly.
 - Do not use `--dangerously-bypass-approvals-and-sandbox`.
 - Do not send raw secrets, bearer tokens, private keys, or credential material to the model.
 - Do not pretend this replaces analyst judgment, Defender Offline, EDR, or kernel-level rootkit inspection.
@@ -71,7 +72,7 @@ Common usage:
 powershell -ExecutionPolicy Bypass -File codex/skills/sentinelc-incident-response/scripts/invoke-codex-triage.ps1 `
   -ScanJson .\scan\sentinelc.json
 
-# Run SentinelC first, then ask Codex for an analyst plan
+# Run SentinelC first, then ask Codex to orchestrate the security-agent plan
 powershell -ExecutionPolicy Bypass -File codex/skills/sentinelc-incident-response/scripts/invoke-codex-triage.ps1 `
   -RepoRoot . -Mode offline-like -OfflinePasses 1
 
@@ -93,7 +94,7 @@ The script writes an output directory such as `sentinelc-agent-20260707-120000` 
 
 ## 6. Provider Contract
 
-The first implementation uses the installed Codex CLI:
+The first implementation uses the installed Codex CLI. Once this provider is connected, Codex CLI is the security-agent orchestrator. SentinelC scanning, parsing, cleanup planning, and verification remain separate tools that Codex sequences through structured output.
 
 ```powershell
 codex `
@@ -126,7 +127,8 @@ Provider rules:
 - Use `--ephemeral` so sensitive incident prompts are not intentionally persisted in Codex session history.
 - Use `--color never` for deterministic provider logs.
 - Treat a non-zero Codex exit as a failed provider call but preserve artifacts.
-- The provider output must match the JSON schema before rendering the Markdown plan.
+- The provider output must pass a local required-field and orchestrator-role shape check before rendering the Markdown plan.
+- The provider must return an `orchestration` object that identifies `codex_cli_orchestrator`, the next recommended tool, the tool sequence, and stop conditions.
 
 ## 7. Agent Input Contract
 
@@ -134,6 +136,7 @@ Provider rules:
 
 - `source_report`: absolute path to the local SentinelC report.
 - `generated_at`: current timestamp.
+- `orchestration_context`: Codex CLI role, connected provider, available SentinelC tools, and the safety boundary.
 - `summary`: SentinelC summary object when present.
 - `cache`: SentinelC cache object when present.
 - `limitations`: report limitations split into lines.
@@ -173,6 +176,7 @@ Codex must return JSON with:
 - `overall_assessment`
 - `risk_score`
 - `executive_summary`
+- `orchestration`
 - `priority_findings`
 - `investigation_plan`
 - `cleanup_plan`
@@ -205,6 +209,15 @@ Allowed `action_type` values:
 
 The Markdown renderer must not turn `command_hint` into an automatic script. It is only analyst guidance.
 
+The `orchestration` object must include:
+
+- `role`: always `codex_cli_orchestrator`.
+- `connected_provider`: normally `codex-cli`.
+- `current_stage`: one of `triage`, `investigation`, `cleanup_planning`, `verification`, `monitoring`, or `blocked`.
+- `next_recommended_tool`: the next SentinelC script or native scan mode Codex wants the wrapper/operator to run.
+- `tool_sequence`: ordered tool steps with purpose, inputs, expected output, and human gate. `inputs` must be a list of strings because Codex CLI response schemas reject `oneOf` in this position.
+- `stop_conditions`: conditions that should stop automation and require human review.
+
 ## 9. Safety Policy
 
 The model may recommend investigation and cleanup, but all cleanup remains human-gated.
@@ -218,6 +231,7 @@ The script must:
 - Never pass `--interactive`, `--kill`, `--suspend`, `--disable-service`, `--quarantine`, `--yes`, or `--force-critical`.
 - Never use Codex CLI write-capable sandboxes for this workflow, even if the caller asks for automatic cleanup.
 - Preserve existing SentinelC limitations in the AI prompt and output.
+- Treat Codex orchestration as control-plane guidance only; tool execution still happens through local scripts with their existing safety guards.
 
 ## 10. Implementation Plan
 
@@ -225,7 +239,7 @@ The script must:
 2. Add `invoke-codex-triage.ps1` under the skill package.
 3. Duplicate those artifacts into the plugin bundle.
 4. Update both `SKILL.md` files to mention the agent workflow.
-5. Update plugin metadata prompt examples to include Codex triage.
+5. Update plugin metadata prompt examples to include Codex orchestration.
 6. Update `.gitignore` for local `sentinelc-agent-*` output directories.
 7. Test:
    - PowerShell parser checks for new and existing scripts.
@@ -241,6 +255,8 @@ The script must:
 - New script refuses missing Codex on real provider calls.
 - New script invokes Codex only with read-only/non-interactive provider settings.
 - New script adds `--ephemeral` and `--color never` to provider calls.
+- New script makes Codex CLI the orchestrator by requiring and rendering an `orchestration` object.
+- New script fails closed when Codex omits required top-level or orchestration fields.
 - Output schema is valid JSON.
 - Both standalone skill and plugin bundle contain the agent workflow.
 - Build and script syntax tests pass.
@@ -274,3 +290,14 @@ Corrections applied:
 - Added `--ephemeral` to the provider command and acceptance criteria.
 - Added `--color never` to the provider command and provider rules.
 - Left the read-only sandbox and no-approval settings intact.
+
+### Orchestration Clarification
+
+Finding:
+
+- The implementation initially treated Codex CLI as an optional analyst pass. The intended agent behavior is stronger: once Codex CLI is connected, the CLI should orchestrate the SentinelC security-agent workflow.
+
+Correction applied:
+
+- Added an orchestration contract to the spec, input packet, output schema, prompt, status file, and Markdown renderer.
+- Kept host mutation outside the Codex path. Codex chooses and explains the next tool sequence, while SentinelC scripts keep their existing evidence, cleanup, and verification gates.

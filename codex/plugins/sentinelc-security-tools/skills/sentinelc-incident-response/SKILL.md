@@ -1,6 +1,6 @@
 ---
 name: sentinelc-incident-response
-description: Run SentinelC Windows malware, spyware, keylogger, rootkit, persistence, Defender tamper, offline-like VSS, Codex CLI agent triage, and cleanup-verification workflows. Use when the user asks to run SentinelC, analyze SentinelC JSON findings, ask Codex to investigate findings, investigate malware leads, remove risky Defender exclusions, disable unwanted persistence, quarantine suspicious files, or verify a cleanup.
+description: Run SentinelC Windows malware, spyware, keylogger, rootkit, persistence, Defender tamper, offline-like VSS, Codex CLI agent orchestration, and cleanup-verification workflows. Use when the user asks to run SentinelC, analyze SentinelC JSON findings, ask Codex to orchestrate investigation, investigate malware leads, remove risky Defender exclusions, disable unwanted persistence, quarantine suspicious files, or verify a cleanup.
 ---
 
 # SentinelC Incident Response
@@ -32,10 +32,10 @@ Use this skill to run SentinelC safely, turn findings into an action plan, perfo
    - Use `scripts/parse-sentinelc-findings.py`.
    - Read `references/rule-action-map.md` for rule-specific priority and action guidance.
 
-4. Optionally ask Codex CLI for an agentic analyst plan.
+4. When Codex CLI is connected, use it as the security-agent orchestrator.
    - Use `scripts/invoke-codex-triage.ps1` with `-ScanJson` for an existing report or with `-RepoRoot` to run a scan first.
    - Use `-DryRun` first when reviewing what evidence will be sent to the configured Codex provider.
-   - Codex must run read-only and ephemeral; treat its output as analyst guidance, not authorization to mutate the host.
+   - Codex must run read-only and ephemeral; treat its orchestration output as control-plane guidance, not authorization to mutate the host.
 
 5. Investigate before action.
    - Confirm live path, signature, hash, parent process, service start mode, startup entry, and listener state.
@@ -56,7 +56,7 @@ Use this skill to run SentinelC safely, turn findings into an action plan, perfo
 
 - `scripts/run-sentinelc-scan.ps1`: run SentinelC, optionally elevate, and write JSON/stderr/status files.
 - `scripts/parse-sentinelc-findings.py`: summarize SentinelC JSON and produce a Markdown action plan.
-- `scripts/invoke-codex-triage.ps1`: compact and redact SentinelC JSON, call Codex CLI in read-only ephemeral mode, and render an agent analyst plan.
+- `scripts/invoke-codex-triage.ps1`: compact and redact SentinelC JSON, call Codex CLI in read-only ephemeral mode, and render an agent orchestration plan.
 - `scripts/safe-cleanup-template.ps1`: parameterized cleanup wrapper with evidence capture.
 - `scripts/verify-sentinelc-cleanup.ps1`: run a verification scan and parse the result.
 
@@ -64,4 +64,4 @@ Use this skill to run SentinelC safely, turn findings into an action plan, perfo
 
 - `references/rule-action-map.md`: rule priorities, likely false positives, and safe actions.
 - `references/destructive-action-policy.md`: cleanup guardrails and rollback expectations.
-- `schemas/agent-plan.schema.json`: required structured output for Codex CLI triage.
+- `schemas/agent-plan.schema.json`: required structured output for Codex CLI orchestration.
